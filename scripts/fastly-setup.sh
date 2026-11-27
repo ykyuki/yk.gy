@@ -113,7 +113,7 @@ if [ "$APPLY" = 1 ]; then
 fi
 
 have_backend() { [ "$APPLY" = 1 ] && fastly service backend list --service-id "$SID" --version "$VERSION" --json | jq -e --arg b "$1" 'any((. // [])[]; .Name == $b)' >/dev/null; }
-have_link() { [ "$APPLY" = 1 ] && fastly service resource-link list --service-id "$SID" --version "$VERSION" --json | jq -e --arg n "$1" 'any((. // [])[]; .Name == $n)' >/dev/null; }
+have_link() { [ "$APPLY" = 1 ] && fastly service resource-link list --service-id "$SID" --version "$VERSION" --json | jq -e --arg n "$1" 'any((. // [])[]; (.name // .Name) == $n)' >/dev/null; }
 
 # ---------------------------------------------------------------- domain
 # Domains use the Domain Management API (account-level, not versioned); the
@@ -198,8 +198,12 @@ else
 fi
 
 if [ "$APPLY" = 1 ]; then
-  fastly service version validate --service-id "$SID" --version "$VERSION" >&2 || \
-    echo "NOTE: validation fails until a Compute package is uploaded; the first GitHub Actions deploy does that." >&2
+  if fastly service version validate --service-id "$SID" --version "$VERSION" >/dev/null 2>&1; then
+    echo "Service version $VERSION is valid."
+  else
+    echo "NOTE: version $VERSION is not valid yet because no Compute package has been uploaded."
+    echo "      This is expected; the first GitHub Actions deploy uploads the package and activates it."
+  fi
 fi
 
 cat <<EOF
