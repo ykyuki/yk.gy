@@ -21,7 +21,7 @@ var (
 	ErrUnavailable = errors.New("storage: unavailable")
 )
 
-// Link is the value stored under a short code. Links never expire.
+// Link is the value stored under a short code (stored without a TTL).
 type Link struct {
 	URL       string    `json:"url"`
 	CreatedAt time.Time `json:"created_at"`

@@ -149,7 +149,7 @@ Rules:
 - The same URL always returns the same short URL ("created": false), so retrying is safe.
 - Rate limited per client; on HTTP 429 wait for the Retry-After seconds.
 - Errors are JSON: {"error":{"code":"...","message":"..."}} (messages are in Japanese).
-- Short URLs never expire.
+- This service is in alpha: it may be unstable, and short URLs and data may be deleted without notice.
 
 ## API
 

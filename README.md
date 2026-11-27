@@ -1,6 +1,6 @@
 # yk.gy — Fastly Compute + Go の短縮URLサービス
 
-URLを入力すると 7 文字（Base62）の短縮URLを発行し、アクセスされると HTTP 302 で元のURLへリダイレクトする、ログイン不要・無期限のシンプルな短縮URLサービスです。Fastly Compute（Go / WebAssembly）上で動作し、データは Fastly KV Store に保存します。
+URLを入力すると 7 文字（Base62）の短縮URLを発行し、アクセスされると HTTP 302 で元のURLへリダイレクトする、ログイン不要のシンプルな短縮URLサービスです（現在α版）。Fastly Compute（Go / WebAssembly）上で動作し、データは Fastly KV Store に保存します。
 
 | 環境 | URL | ブランチ | Fastly サービス | デプロイ |
 |---|---|---|---|---|
