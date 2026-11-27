@@ -34,6 +34,9 @@ func TestClientSafe(t *testing.T) {
 	if u.Query().Get("urls") != "https://example.com/a?b=1&c=2" {
 		t.Fatalf("url not encoded correctly: %s", h.gotURL)
 	}
+	if u.Query().Get("alt") != "json" {
+		t.Fatalf("alt=json is required, otherwise the API answers in protobuf: %s", h.gotURL)
+	}
 	if u.Query().Get("key") != "" {
 		t.Fatal("api key must not be in the query string")
 	}
@@ -122,5 +125,13 @@ func TestMock(t *testing.T) {
 	}
 	if _, err := m.Check(context.Background(), "https://sb-unavailable.example.com/"); !errors.Is(err, ErrUnavailable) {
 		t.Errorf("outage host should return ErrUnavailable, got %v", err)
+	}
+}
+
+func TestClientRejectsProtobufBody(t *testing.T) {
+	// What the API returns without alt=json: must fail closed, not pass.
+	h := &fakeHTTP{status: 200, body: "\x0a\x05threat"}
+	if v, err := (&Client{APIKey: "k", HTTP: h}).Check(context.Background(), "https://example.com/"); !errors.Is(err, ErrUnavailable) || v.Safe {
+		t.Fatalf("protobuf body must be ErrUnavailable, got v=%+v err=%v", v, err)
 	}
 }

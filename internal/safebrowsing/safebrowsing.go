@@ -71,6 +71,9 @@ func (c *Client) Check(ctx context.Context, rawURL string) (Verdict, error) {
 	}
 	q := url.Values{}
 	q.Set("urls", rawURL)
+	// Google APIs answer in protobuf (application/x-protobuf) by default and
+	// ignore the Accept header; alt=json selects the JSON encoding.
+	q.Set("alt", "json")
 	// The API key is sent as a header rather than a query parameter so it
 	// does not end up in URL-based logs.
 	status, body, err := c.HTTP.Get(ctx, ep+"?"+q.Encode(), map[string]string{
