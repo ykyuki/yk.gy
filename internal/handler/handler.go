@@ -291,12 +291,14 @@ func (h *Handler) health(ctx context.Context, w fsthttp.ResponseWriter, r *fstht
 		} else if v, err := h.Service.Checker.Check(ctx, deepCheckURL); err != nil || !v.Safe {
 			resp.Checks["safebrowsing"] = "error"
 			if err != nil {
+				// Non-sensitive classification only (no key, no URL).
+				resp.Checks["safebrowsing"] = "error: " + safebrowsing.Reason(err)
 				h.log(map[string]any{"event": "deep_health_safebrowsing_error", "error": err.Error()})
 			}
 		} else {
 			resp.Checks["safebrowsing"] = "ok"
 		}
-		if resp.Checks["safebrowsing"] == "error" {
+		if strings.HasPrefix(resp.Checks["safebrowsing"], "error") {
 			resp.Status = "degraded"
 			status = fsthttp.StatusServiceUnavailable
 		}
