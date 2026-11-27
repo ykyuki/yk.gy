@@ -110,3 +110,6 @@ h2 { font-size: 1.1rem; margin: 0 0 8px; }
 .ai code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .ai .note { color: var(--muted); font-size: .85rem; }
 .ai a { color: var(--accent); }
+
+.disclaimer { font-size: .75rem; line-height: 1.5; color: var(--muted); margin-top: 12px; }
+.disclaimer small { font-size: inherit; }
