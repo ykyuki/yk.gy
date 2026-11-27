@@ -128,4 +128,3 @@ h2 { font-size: 1.1rem; margin: 0 0 8px; }
 .policy a { color: var(--accent); }
 .policy .meta { color: var(--muted); font-size: .85rem; margin-top: 0; }
 .policy .back { font-size: .9rem; }
-mark.todo { background: #fde68a; color: #1d2330; padding: 0 4px; border-radius: 4px; }
