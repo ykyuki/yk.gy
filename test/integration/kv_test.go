@@ -99,11 +99,12 @@ func TestCacheRateLimiter(t *testing.T) {
 	if ok, _ := w.Allow("203.0.113.1"); ok {
 		t.Fatal("penalty box must still block (real cache TTL not expired)")
 	}
-	// Values round-trip through the cache.
-	if err := (ratelimit.CoreCacheStore{}).Set(w.Prefix+"x", "42", time.Minute); err != nil {
-		t.Fatal(err)
+	// Slots are insert-only: a second claim of the same key must lose.
+	st := ratelimit.CoreCacheStore{}
+	if ok, err := st.Claim(w.Prefix+"x", time.Minute); err != nil || !ok {
+		t.Fatalf("first claim: ok=%v err=%v", ok, err)
 	}
-	if v, ok, err := (ratelimit.CoreCacheStore{}).Get(w.Prefix + "x"); err != nil || !ok || v != "42" {
-		t.Fatalf("v=%q ok=%v err=%v", v, ok, err)
+	if ok, err := st.Claim(w.Prefix+"x", time.Minute); err != nil || ok {
+		t.Fatalf("second claim must lose: ok=%v err=%v", ok, err)
 	}
 }
