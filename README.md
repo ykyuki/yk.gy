@@ -606,6 +606,26 @@ fastly kv-store-entry create --store-id <本番KV ID> --key <CODE> --value '{"ur
 
 ---
 
+### ログ（記録する内容と IP アドレスの扱い）
+
+アプリは出来事を1件ずつ JSON で、ログ出力先 `app_log` に送ります。開発環境は Datadog（リージョン US5）に送っています。本番はまだ `app_log` が未設定なので、記録は残りません。
+
+| `event` | 記録するタイミング | 主な項目 |
+|---|---|---|
+| `page_view` | トップページの表示（GET） | `path` |
+| `redirect` | 短縮 URL へのアクセス | `code`、`status`（302 / 404 / 410）、`target_host`（302 のとき） |
+| `link_created` | 新しい短縮 URL の発行 | `code`、`target_host` |
+| `unsafe_rejected` | Safe Browsing による拒否 | `threats` |
+| `rate_limited` | レート制限による拒否 | `rate_key`（IPv6 は /64） |
+| `safebrowsing_unavailable` / `deep_health_safebrowsing_error` / `ratelimit_error` / `shorten_failed` / `resolve_failed` | 障害 | `error` |
+
+**すべてのログ**に、`env`・`service_version`・`country`（Fastly のジオロケーションで判定した国コード）・`ip`（**完全な IP アドレス**）が付きます。
+
+- **EU 27か国・EEA 3か国（アイスランド・リヒテンシュタイン・ノルウェー）・英国からのアクセスでは、`ip` を `null` にします**（GDPR / UK GDPR への配慮）。国を判定できなかった場合も `null` にします（`internal/privacy`）。
+- CSS・JS などの静的ファイル、HEAD リクエスト、`/healthz` は記録しません。
+- ローカル（`fastly compute serve`）では、`fastly.toml` の `[local_server.geolocation]` で `127.0.0.1` を日本（JP）として扱います。
+- IP アドレスを記録するので、プライバシーポリシー（収集する情報、目的、保存期間、預け先）を公開し、Datadog の保存期間とアクセス権を必要な範囲に絞ることをおすすめします。
+
 ## 9. 環境ごとのテスト方法
 
 | 対象 | コマンド | 内容 |

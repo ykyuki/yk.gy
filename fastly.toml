@@ -50,6 +50,20 @@ service_id = ""
       ratelimit_on_error = "deny"
       redirect_cache_ttl_seconds = "0"
 
+  # Geolocation used by the logger (country code; IP is logged as null for
+  # EU/EEA/UK). Local requests come from 127.0.0.1, mapped to Japan here.
+  [local_server.geolocation]
+    use_default_loopback = false
+    format = "inline-toml"
+    [local_server.geolocation.addresses]
+      [local_server.geolocation.addresses."127.0.0.1"]
+        as_name = "local"
+        as_number = 0
+        country_code = "JP"
+        country_code3 = "JPN"
+        country_name = "Japan"
+        continent = "AS"
+
   [local_server.secret_stores]
     # Empty unless you export SAFE_BROWSING_API_KEY yourself (live mode).
     [[local_server.secret_stores.secrets]]

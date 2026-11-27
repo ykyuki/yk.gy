@@ -400,3 +400,102 @@ func TestNoindexOutsideProduction(t *testing.T) {
 		t.Errorf("production API must stay noindex, got %q", got)
 	}
 }
+
+func lastEvent(t *testing.T, e *env, name string) map[string]any {
+	t.Helper()
+	for i := len(e.logs) - 1; i >= 0; i-- {
+		if e.logs[i]["event"] == name {
+			return e.logs[i]
+		}
+	}
+	t.Fatalf("no %q event in %v", name, e.logs)
+	return nil
+}
+
+func TestAccessLogsCarryIPExceptEUAndUK(t *testing.T) {
+	cases := []struct {
+		country string
+		wantIP  any
+	}{
+		{"JP", "203.0.113.5"},
+		{"US", "203.0.113.5"},
+		{"CH", "203.0.113.5"},
+		{"DE", nil},
+		{"FR", nil},
+		{"NO", nil}, // EEA
+		{"GB", nil}, // UK GDPR
+		{"", nil},   // unknown -> treated as EU
+	}
+	for _, c := range cases {
+		e := newEnv(t, safebrowsing.Mock{})
+		country := c.country
+		e.h.Country = func(string) string { return country }
+
+		do(e.h, "GET", "/", "", "", nil)
+		do(e.h, "GET", "/Example", "", "", nil)
+		do(e.h, "GET", "/Nope123", "", "", nil)
+		post(e.h, `{"url":"https://www.example.org/log"}`)
+
+		for _, name := range []string{"page_view", "redirect", "link_created"} {
+			ev := lastEvent(t, e, name)
+			if ev["ip"] != c.wantIP {
+				t.Errorf("country=%q %s: ip=%v want %v", c.country, name, ev["ip"], c.wantIP)
+			}
+			wantCountry := any(c.country)
+			if c.country == "" {
+				wantCountry = nil
+			}
+			if ev["country"] != wantCountry {
+				t.Errorf("country=%q %s: country=%v", c.country, name, ev["country"])
+			}
+		}
+	}
+}
+
+func TestPageViewAndRedirectEvents(t *testing.T) {
+	e := newEnv(t, safebrowsing.Mock{})
+	e.h.Country = func(string) string { return "JP" }
+	do(e.h, "GET", "/", "", "", nil)
+	if ev := lastEvent(t, e, "page_view"); ev["path"] != "/" || ev["env"] != "production" {
+		t.Fatalf("%v", ev)
+	}
+	do(e.h, "GET", "/Example", "", "", nil)
+	ev := lastEvent(t, e, "redirect")
+	if ev["code"] != "Example" || ev["status"] != 302 || ev["target_host"] != "example.com" {
+		t.Fatalf("302: %v", ev)
+	}
+	do(e.h, "GET", "/Nope123", "", "", nil)
+	if ev := lastEvent(t, e, "redirect"); ev["status"] != 404 || ev["code"] != "Nope123" {
+		t.Fatalf("404: %v", ev)
+	}
+	do(e.h, "GET", "/Disabld", "", "", nil)
+	if ev := lastEvent(t, e, "redirect"); ev["status"] != 410 {
+		t.Fatalf("410: %v", ev)
+	}
+	// No events for HEAD on the page or for static assets.
+	n := len(e.logs)
+	do(e.h, "HEAD", "/", "", "", nil)
+	e.h.Assets["style.css"] = Asset{ContentType: "text/css", Body: []byte("x")}
+	do(e.h, "GET", "/style.css", "", "", nil)
+	if len(e.logs) != n {
+		t.Fatalf("unexpected events: %v", e.logs[n:])
+	}
+}
+
+func TestRateLimitedEventUsesSameIPRule(t *testing.T) {
+	for country, want := range map[string]any{"JP": "203.0.113.5", "IE": nil} {
+		e := newEnv(t, safebrowsing.Mock{})
+		c := country
+		e.h.Country = func(string) string { return c }
+		for i := 0; i < 4; i++ {
+			post(e.h, `{"url":"https://example.org/`+string(rune('a'+i))+`"}`)
+		}
+		ev := lastEvent(t, e, "rate_limited")
+		if ev["ip"] != want || ev["rate_key"] != "203.0.113.5" {
+			t.Errorf("%s: %v", country, ev)
+		}
+		if _, ok := ev["client"]; ok {
+			t.Error("old client field must be gone")
+		}
+	}
+}

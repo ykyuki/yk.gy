@@ -15,6 +15,7 @@ import (
 	"github.com/fastly/compute-sdk-go/fsthttp"
 
 	"github.com/ykyuki/yk.gy/internal/config"
+	"github.com/ykyuki/yk.gy/internal/privacy"
 	"github.com/ykyuki/yk.gy/internal/ratelimit"
 	"github.com/ykyuki/yk.gy/internal/safebrowsing"
 	"github.com/ykyuki/yk.gy/internal/shortener"
@@ -48,10 +49,19 @@ type Handler struct {
 	// LocalRuntime is true only on the local development server.
 	LocalRuntime bool
 	Assets       map[string]Asset
+	// Country returns the ISO 3166-1 alpha-2 country of an IP address ("" if
+	// unknown). On Fastly it uses the built-in geolocation.
+	Country func(ip string) string
+
+	// Per-request client info for logging (the handler is built per request).
+	clientIP      string
+	clientCountry string
+	countryLooked bool
 }
 
 // ServeHTTP implements fsthttp.Handler.
 func (h *Handler) ServeHTTP(ctx context.Context, w fsthttp.ResponseWriter, r *fsthttp.Request) {
+	h.clientIP, h.clientCountry, h.countryLooked = privacy.ClientIP(r.RemoteAddr), "", false
 	h.securityHeaders(w)
 	path := r.URL.Path
 
@@ -83,6 +93,9 @@ func (h *Handler) ServeHTTP(ctx context.Context, w fsthttp.ResponseWriter, r *fs
 
 	switch path {
 	case "/", "/index.html":
+		if r.Method == fsthttp.MethodGet {
+			h.log(map[string]any{"event": "page_view", "path": path})
+		}
 		h.asset(w, r, "index.html")
 		return
 	case "/style.css", "/app.js", "/favicon.svg", "/robots.txt":
@@ -184,7 +197,7 @@ func (h *Handler) shortenURL(ctx context.Context, r *fsthttp.Request, rawURL str
 				return outcome{Status: fsthttp.StatusServiceUnavailable, ErrCode: "ratelimit_unavailable", ErrMsg: "現在URLを発行できません。しばらくしてから再度お試しください"}
 			}
 		} else if !ok {
-			h.log(map[string]any{"event": "rate_limited", "client": key})
+			h.log(map[string]any{"event": "rate_limited", "rate_key": key})
 			return outcome{Status: fsthttp.StatusTooManyRequests, ErrCode: "rate_limited", ErrMsg: "リクエストが多すぎます。しばらく待ってから再度お試しください", RetryAfter: int(h.Config.RatePenalty.Seconds())}
 		}
 	}
@@ -277,6 +290,7 @@ func (h *Handler) redirect(ctx context.Context, w fsthttp.ResponseWriter, r *fst
 	link, err := h.Service.Resolve(ctx, code)
 	switch {
 	case errors.Is(err, storage.ErrNotFound):
+		h.log(map[string]any{"event": "redirect", "code": code, "status": fsthttp.StatusNotFound})
 		h.notFound(w, r)
 		return
 	case err != nil:
@@ -284,15 +298,18 @@ func (h *Handler) redirect(ctx context.Context, w fsthttp.ResponseWriter, r *fst
 		h.textError(w, fsthttp.StatusServiceUnavailable, "一時的にご利用いただけません")
 		return
 	case link.Disabled:
+		h.log(map[string]any{"event": "redirect", "code": code, "status": fsthttp.StatusGone})
 		h.textError(w, fsthttp.StatusGone, "このリンクは無効化されています")
 		return
 	}
 	// Defence in depth: never emit a redirect to a non-http(s) target even
 	// if the stored record was tampered with.
 	if u, perr := url.Parse(link.URL); perr != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		h.log(map[string]any{"event": "redirect", "code": code, "status": fsthttp.StatusGone, "reason": "invalid_target"})
 		h.textError(w, fsthttp.StatusGone, "このリンクは無効です")
 		return
 	}
+	h.log(map[string]any{"event": "redirect", "code": code, "status": fsthttp.StatusFound, "target_host": hostOf(link.URL)})
 	w.Header().Set("Location", link.URL)
 	w.Header().Set("Cache-Control", "private, max-age=90")
 	w.WriteHeader(fsthttp.StatusFound)
@@ -397,13 +414,37 @@ func (h *Handler) writeJSON(w fsthttp.ResponseWriter, status int, v any) {
 	_, _ = w.Write(b)
 }
 
+// log emits one structured event. Every event carries the client's full IP
+// address and country, except that the IP is null for visitors from the
+// EU/EEA/UK (and when the country is unknown), see internal/privacy.
 func (h *Handler) log(ev map[string]any) {
 	if h.Log == nil {
 		return
 	}
 	ev["env"] = h.Config.Environment
 	ev["service_version"] = h.ServiceVersion
+	country := h.country()
+	if country != "" {
+		ev["country"] = country
+	} else {
+		ev["country"] = nil
+	}
+	if h.clientIP != "" && privacy.IPAllowed(country) {
+		ev["ip"] = h.clientIP
+	} else {
+		ev["ip"] = nil
+	}
 	h.Log(ev)
+}
+
+func (h *Handler) country() string {
+	if !h.countryLooked {
+		h.countryLooked = true
+		if h.Country != nil && h.clientIP != "" {
+			h.clientCountry = strings.ToUpper(strings.TrimSpace(h.Country(h.clientIP)))
+		}
+	}
+	return h.clientCountry
 }
 
 func (h *Handler) baseURL(r *fsthttp.Request) string {
