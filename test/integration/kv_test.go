@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fastly/compute-sdk-go/cache/core"
+
 	"github.com/ykyuki/yk.gy/internal/ratelimit"
 	"github.com/ykyuki/yk.gy/internal/safebrowsing"
 	"github.com/ykyuki/yk.gy/internal/shortener"
@@ -66,9 +68,43 @@ func TestMissingStoreFailsClosed(t *testing.T) {
 	}
 }
 
-func TestERLHostcallsAvailable(t *testing.T) {
-	l := ratelimit.NewERL("shorten_rc", "shorten_pb", ratelimit.Policy{PerMinute: 10, Penalty: time.Minute})
-	if _, err := l.Allow("203.0.113.1"); err != nil {
-		t.Fatalf("ERL hostcalls failed: %v", err)
+// TestCacheRateLimiter runs the real limiter against Viceroy's Core Cache.
+func TestCacheRateLimiter(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 10, 0, time.UTC)
+	w := &ratelimit.Window{
+		Store:  ratelimit.CoreCacheStore{},
+		Policy: ratelimit.Policy{PerMinute: 5, Penalty: time.Minute},
+		Prefix: "itest:" + time.Now().Format("150405.000000") + ":",
+		Now:    func() time.Time { return now },
+	}
+	for i := 0; i < 5; i++ {
+		ok, err := w.Allow("203.0.113.1")
+		if errors.Is(err, core.ErrUnsupported) {
+			// Viceroy cannot read Core Cache entries from the Go SDK; the
+			// limiter is verified on Fastly by the dev smoke test instead.
+			t.Skipf("Core Cache lookups unsupported in this Viceroy: %v", err)
+		}
+		if err != nil || !ok {
+			t.Fatalf("request %d: ok=%v err=%v", i, ok, err)
+		}
+	}
+	if ok, err := w.Allow("203.0.113.1"); err != nil || ok {
+		t.Fatalf("6th request must be limited: ok=%v err=%v", ok, err)
+	}
+	if ok, err := w.Allow("203.0.113.2"); err != nil || !ok {
+		t.Fatalf("other client must pass: ok=%v err=%v", ok, err)
+	}
+	// Still blocked by the penalty box even though the logical minute moved on.
+	now = now.Add(2 * time.Minute)
+	if ok, _ := w.Allow("203.0.113.1"); ok {
+		t.Fatal("penalty box must still block (real cache TTL not expired)")
+	}
+	// Slots are insert-only: a second claim of the same key must lose.
+	st := ratelimit.CoreCacheStore{}
+	if ok, err := st.Claim(w.Prefix+"x", time.Minute); err != nil || !ok {
+		t.Fatalf("first claim: ok=%v err=%v", ok, err)
+	}
+	if ok, err := st.Claim(w.Prefix+"x", time.Minute); err != nil || ok {
+		t.Fatalf("second claim must lose: ok=%v err=%v", ok, err)
 	}
 }

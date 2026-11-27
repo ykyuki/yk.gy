@@ -100,6 +100,11 @@
     copyStatus.textContent = "コピーできませんでした。手動で選択してコピーしてください";
   }
 
+  // Show this environment's origin in the "AI" usage examples.
+  Array.prototype.forEach.call(document.querySelectorAll(".base-url"), function (el) {
+    el.textContent = window.location.origin;
+  });
+
   // Show a small badge outside production so environments are never confused.
   fetch("/healthz", { cache: "no-store" })
     .then(function (r) { return r.json(); })

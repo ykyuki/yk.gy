@@ -94,3 +94,26 @@ footer { color: var(--muted); font-size: .85rem; }
   .row { flex-direction: column; }
   button { width: 100%; }
 }
+
+h2 { font-size: 1.1rem; margin: 0 0 8px; }
+.ai p { margin: 0 0 10px; }
+.ai .label { margin-top: 14px; }
+.ai pre {
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: .85rem;
+}
+.ai code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.ai .note { color: var(--muted); font-size: .85rem; }
+.ai a { color: var(--accent); }
+
+.disclaimer { font-size: .75rem; line-height: 1.5; color: var(--muted); margin-top: 12px; }
+.disclaimer small { font-size: inherit; }
+
+.footer-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-top: 12px; }
+.footer-meta p { margin: 0; }
+.contact a { color: var(--accent); }

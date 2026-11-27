@@ -4,7 +4,6 @@ package ratelimit
 import (
 	"errors"
 	"net/netip"
-	"sync"
 	"time"
 )
 
@@ -41,45 +40,4 @@ func ClientKey(remoteAddr string) string {
 		return p.String()
 	}
 	return a.String()
-}
-
-// Memory is an in-process limiter used by tests.
-type Memory struct {
-	Policy Policy
-	Now    func() time.Time
-
-	mu      sync.Mutex
-	hits    map[string][]time.Time
-	blocked map[string]time.Time
-}
-
-// Allow implements Limiter.
-func (m *Memory) Allow(key string) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	now := time.Now()
-	if m.Now != nil {
-		now = m.Now()
-	}
-	if m.hits == nil {
-		m.hits = map[string][]time.Time{}
-		m.blocked = map[string]time.Time{}
-	}
-	if until, ok := m.blocked[key]; ok && now.Before(until) {
-		return false, nil
-	}
-	cutoff := now.Add(-time.Minute)
-	h := m.hits[key][:0]
-	for _, t := range m.hits[key] {
-		if t.After(cutoff) {
-			h = append(h, t)
-		}
-	}
-	if uint32(len(h)) >= m.Policy.PerMinute {
-		m.blocked[key] = now.Add(m.Policy.Penalty)
-		m.hits[key] = h
-		return false, nil
-	}
-	m.hits[key] = append(h, now)
-	return true, nil
 }

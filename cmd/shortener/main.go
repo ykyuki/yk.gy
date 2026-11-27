@@ -15,6 +15,7 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/fastly/compute-sdk-go/cache/core"
 	"github.com/fastly/compute-sdk-go/configstore"
 	"github.com/fastly/compute-sdk-go/fsthttp"
 	"github.com/fastly/compute-sdk-go/rtlog"
@@ -63,7 +64,7 @@ func buildHandler() *handler.Handler {
 			Checker:    checker,
 			Validation: validation.Options{ShortHosts: cfg.ShortHosts, BlockedHosts: cfg.BlockedHosts},
 		},
-		Limiter: ratelimit.NewERL(config.RateCounter, config.PenaltyBox, ratelimit.Policy{PerMinute: cfg.RatePerMinute, Penalty: cfg.RatePenalty}),
+		Limiter: newLimiter(cfg, local, logger),
 		Health: func() map[string]error {
 			_, cerr := configstore.Open(config.ConfigStoreName)
 			_, serr := secretstore.Open(config.SecretStoreName)
@@ -74,6 +75,28 @@ func buildHandler() *handler.Handler {
 		ServiceVersion: os.Getenv("FASTLY_SERVICE_VERSION"),
 		LocalRuntime:   local,
 		Assets:         assets,
+	}
+}
+
+// newLimiter builds the cache-based rate limiter. Only on the local server
+// (Viceroy, which cannot read Core Cache entries from the Go SDK) an
+// "unsupported" cache error lets the request through with a warning; on
+// Fastly every cache error fails closed.
+func newLimiter(cfg config.Config, local bool, logger handler.Logger) ratelimit.Limiter {
+	w := &ratelimit.Window{
+		Store:  ratelimit.CoreCacheStore{},
+		Policy: ratelimit.Policy{PerMinute: cfg.RatePerMinute, Penalty: cfg.RatePenalty},
+		Prefix: config.RateLimitPrefix,
+	}
+	if !local {
+		return w
+	}
+	return ratelimit.LocalUnsupportedFallback{
+		Limiter:     w,
+		Unsupported: core.ErrUnsupported,
+		Warn: func(err error) {
+			logger(map[string]any{"event": "ratelimit_local_unsupported", "error": err.Error(), "msg": "rate limiting skipped on the local server only"})
+		},
 	}
 }
 
@@ -130,12 +153,12 @@ func commit() string {
 // fastlyHTTP sends requests to a static Fastly backend, bypassing the cache.
 type fastlyHTTP struct{ backend string }
 
-func (f fastlyHTTP) Get(ctx context.Context, url string, header map[string]string) (int, []byte, error) {
+func (f fastlyHTTP) Get(ctx context.Context, url string, header map[string]string) (safebrowsing.Response, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	req, err := fsthttp.NewRequest(fsthttp.MethodGet, url, nil)
 	if err != nil {
-		return 0, nil, err
+		return safebrowsing.Response{}, err
 	}
 	for k, v := range header {
 		req.Header.Set(k, v)
@@ -143,12 +166,12 @@ func (f fastlyHTTP) Get(ctx context.Context, url string, header map[string]strin
 	req.CacheOptions.Pass = true
 	resp, err := req.Send(ctx, f.backend)
 	if err != nil {
-		return 0, nil, err
+		return safebrowsing.Response{}, err
 	}
 	defer resp.Body.Close()
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20+1))
 	if err != nil {
-		return 0, nil, err
+		return safebrowsing.Response{}, err
 	}
-	return resp.StatusCode, b, nil
+	return safebrowsing.Response{Status: resp.StatusCode, ContentType: resp.Header.Get("Content-Type"), Body: b}, nil
 }

@@ -1,3 +1,17 @@
+# Crawlers: index only the top page and the AI usage docs. The API creates
+# data, so automatic crawlers must not follow /api/ links.
 User-agent: *
 Allow: /$
+Allow: /llms.txt
+Allow: /openapi.json
+Disallow: /
+
+# Agents acting on a user's explicit request may use the API.
+User-agent: ChatGPT-User
+User-agent: Claude-User
+User-agent: Perplexity-User
+Allow: /$
+Allow: /llms.txt
+Allow: /openapi.json
+Allow: /api/shorten
 Disallow: /

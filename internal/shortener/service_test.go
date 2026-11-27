@@ -158,3 +158,46 @@ func TestResolve(t *testing.T) {
 		t.Fatalf("invalid code should be not found, got %v", err)
 	}
 }
+
+func TestShortenSameURLReturnsExistingCode(t *testing.T) {
+	st := storage.NewMemoryStore()
+	c := &fakeChecker{v: safebrowsing.Verdict{Safe: true}}
+	svc := newSvc(st, c)
+	first, err := svc.Shorten(context.Background(), "https://Example.com/a")
+	if err != nil || first.Existing {
+		t.Fatalf("%+v %v", first, err)
+	}
+	// Different spelling, same normalized URL.
+	second, err := svc.Shorten(context.Background(), "  HTTPS://example.COM:443/a ")
+	if err != nil || !second.Existing || second.Code != first.Code {
+		t.Fatalf("expected the existing code: first=%+v second=%+v err=%v", first, second, err)
+	}
+	if c.calls != 1 || st.Len() != 1 {
+		t.Fatalf("dedupe must skip Safe Browsing and storage: calls=%d links=%d", c.calls, st.Len())
+	}
+	if other, _ := svc.Shorten(context.Background(), "https://example.com/b"); other.Code == first.Code || other.Existing {
+		t.Fatal("different URL must get a new code")
+	}
+}
+
+func TestShortenDisabledURLCannotBeRecreated(t *testing.T) {
+	st := storage.NewMemoryStore()
+	_ = st.Create(context.Background(), "Takedwn", storage.Link{URL: "https://bad.example.net/", Disabled: true})
+	_ = st.IndexURL(context.Background(), "https://bad.example.net/", "Takedwn")
+	c := &fakeChecker{v: safebrowsing.Verdict{Safe: true}}
+	_, err := newSvc(st, c).Shorten(context.Background(), "https://bad.example.net/")
+	if !errors.Is(err, ErrDisabled) || c.calls != 0 || st.Len() != 1 {
+		t.Fatalf("err=%v calls=%d links=%d", err, c.calls, st.Len())
+	}
+}
+
+func TestShortenStaleIndexIsIgnored(t *testing.T) {
+	st := storage.NewMemoryStore()
+	// Index points to a code whose link is for another URL (corrupt/stale).
+	_ = st.Create(context.Background(), "Other01", storage.Link{URL: "https://other.example/"})
+	_ = st.IndexURL(context.Background(), "https://example.com/", "Other01")
+	res, err := newSvc(st, &fakeChecker{v: safebrowsing.Verdict{Safe: true}}).Shorten(context.Background(), "https://example.com/")
+	if err != nil || res.Existing || res.Code == "Other01" {
+		t.Fatalf("stale index must not redirect to another URL: %+v %v", res, err)
+	}
+}

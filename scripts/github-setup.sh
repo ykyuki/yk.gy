@@ -9,7 +9,8 @@
 #     (deployable from main only, required reviewer = you, when the plan allows)
 #   - Branch protection for main: PR required, CI checks required, no force
 #     push / deletion, admins included.
-#   - Branch protection for dev: no force push / deletion.
+#   - Branch protection for dev: CI checks required for PRs (admins may still
+#     push directly), no force push / deletion.
 #
 # Secrets are NOT set here. Set them yourself so they never appear in chat or
 # shell history, e.g.:  gh secret set FASTLY_API_TOKEN --env production
@@ -62,7 +63,16 @@ main_rules=$(jq -nc --argjson checks "$CHECKS" '{
   required_linear_history: false,
   required_conversation_resolution: true
 }')
-dev_rules='{"required_status_checks":null,"enforce_admins":false,"required_pull_request_reviews":null,"restrictions":null,"allow_force_pushes":false,"allow_deletions":false}'
+# dev: PRs into dev must pass CI; admins (the owner) may still push directly
+# (enforce_admins=false), which then runs CI inside deploy-dev.yml.
+dev_rules=$(jq -nc --argjson checks "$CHECKS" '{
+  required_status_checks: {strict: false, contexts: $checks},
+  enforce_admins: false,
+  required_pull_request_reviews: null,
+  restrictions: null,
+  allow_force_pushes: false,
+  allow_deletions: false
+}')
 
 if ! api PUT "repos/$REPO/branches/main/protection" "$main_rules"; then
   fallback+=("main: branch protection failed ($LAST_ERR). 'Branch not found' = push main first and re-run; 'Upgrade to GitHub Pro' = plan limit. Alternatives: GitHub Pro, a public repo, or rely on the built-in guards (CI 'Main push guard' + deploy-prod.yml refuses commits that did not come from a merged PR with green CI)")
