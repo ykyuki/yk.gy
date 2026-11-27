@@ -112,12 +112,21 @@ if [ "$APPLY" = 1 ]; then
   echo "Editing service version $VERSION"
 fi
 
-have_domain() { [ "$APPLY" = 1 ] && fastly service domain list --service-id "$SID" --version "$VERSION" --json | jq -e --arg d "$1" 'any((. // [])[]; .Name == $d)' >/dev/null; }
 have_backend() { [ "$APPLY" = 1 ] && fastly service backend list --service-id "$SID" --version "$VERSION" --json | jq -e --arg b "$1" 'any((. // [])[]; .Name == $b)' >/dev/null; }
 have_link() { [ "$APPLY" = 1 ] && fastly service resource-link list --service-id "$SID" --version "$VERSION" --json | jq -e --arg n "$1" 'any((. // [])[]; .Name == $n)' >/dev/null; }
 
 # ---------------------------------------------------------------- domain
-have_domain "$DOMAIN" || run fastly service domain create --service-id "$SID" --version "$VERSION" --name "$DOMAIN"
+# Domains use the Domain Management API (account-level, not versioned); the
+# classic version-scoped domain API is deprecated.
+dom_owner=$(fastly domain list --fqdn "$DOMAIN" --json 2>/dev/null | jq -r --arg d "$DOMAIN" '
+  ([((.data // .Data // []))[] | select((.fqdn // .FQDN) == $d)][0]) as $m
+  | if $m == null then "" else ($m.service_id // $m.ServiceID // "unbound") end' 2>/dev/null)
+case "$dom_owner" in
+  ""|null) run fastly domain create --fqdn "$DOMAIN" --service-id "$SID" --description "yk.gy $ENVIRONMENT";;
+  "$SID")  echo "Domain $DOMAIN already bound to this service";;
+  *)       echo "ERROR: domain $DOMAIN already exists and is bound to '$dom_owner', not $SID. Fix it in the Fastly UI (Domains) and re-run." >&2
+           [ "$APPLY" = 1 ] && exit 1;;
+esac
 
 # ---------------------------------------------------------------- backend
 have_backend safebrowsing || run fastly service backend create --service-id "$SID" --version "$VERSION" \
