@@ -282,7 +282,7 @@ fastly tls-subscription describe --id <SUBSCRIPTION_ID> --include tls_authorizat
 
 - Environment `development`（`dev` からのみデプロイ可）と `production`（`main` からのみデプロイ可。プランが対応していれば Required reviewer も設定）
 - `main` のブランチ保護（PR 必須、必須チェック、force push / 削除の禁止）
-- `dev` の保護（force push / 削除の禁止）
+- `dev` の保護（PR のマージには CI の3チェックの成功が必須、force push / 削除の禁止。管理者（オーナー）は直接 push も可能で、その場合は `deploy-dev.yml` の中で CI が実行され、失敗すればデプロイされない）
 
 ```bash
 scripts/github-setup.sh
@@ -360,7 +360,7 @@ gitGraph
 | ブランチ | 役割 | 作成元 | マージ先 | 直接 push |
 |---|---|---|---|---|
 | `main` | 本番（yk.gy） | — | — | 禁止（PR のみ） |
-| `dev` | 開発環境（dev.yk.gy） | `main` | `main`（PR） | 可。ただし原則は PR |
+| `dev` | 開発環境（dev.yk.gy） | `main` | `main`（PR） | 管理者のみ可。原則は PR（CI 成功が必須） |
 | `feature/*` | 個別機能 | `dev` | `dev`（PR） | 可 |
 | `hotfix/*` | 本番の緊急修正 | `main` | `main`（PR）、その後 `dev` にも反映 | 可 |
 
