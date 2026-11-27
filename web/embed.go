@@ -7,15 +7,16 @@ import (
 	"github.com/ykyuki/yk.gy/internal/handler"
 )
 
-//go:embed index.html style.css app.js favicon.svg robots.txt
+//go:embed index.html privacy.html style.css app.js favicon.svg robots.txt
 var files embed.FS
 
 var contentTypes = map[string]string{
-	"index.html":  "text/html; charset=utf-8",
-	"style.css":   "text/css; charset=utf-8",
-	"app.js":      "text/javascript; charset=utf-8",
-	"favicon.svg": "image/svg+xml",
-	"robots.txt":  "text/plain; charset=utf-8",
+	"index.html":   "text/html; charset=utf-8",
+	"privacy.html": "text/html; charset=utf-8",
+	"style.css":    "text/css; charset=utf-8",
+	"app.js":       "text/javascript; charset=utf-8",
+	"favicon.svg":  "image/svg+xml",
+	"robots.txt":   "text/plain; charset=utf-8",
 }
 
 // Assets returns the embedded files keyed by name.
