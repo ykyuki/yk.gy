@@ -12,6 +12,9 @@
 # Production smoke tests never create links: they only use the pre-seeded smoke
 # link "SmokeT1" and requests that are rejected before anything is stored.
 set -euo pipefail
+# NOTE: never pipe into `grep -q` here. With pipefail, grep exiting early makes
+# the writer die with SIGPIPE (exit 141) and the check fails at random on
+# larger, chunked responses. Match against variables with here-strings.
 
 BASE="${1:?usage: smoke-test.sh <base_url> [...]}"; shift
 BASE="${BASE%/}"
@@ -51,7 +54,7 @@ if [ -n "$COMMIT" ]; then
   case "$cur" in "$COMMIT"*) ok "commit matches $COMMIT";; *) ng "commit is '${cur}', expected '$COMMIT'";; esac
 fi
 if [ -n "$ENV_EXPECT" ]; then
-  printf '%s' "$json" | grep -q "\"environment\":\"$ENV_EXPECT\"" && ok "environment=$ENV_EXPECT" || ng "environment mismatch (expected $ENV_EXPECT)"
+  grep -q "\"environment\":\"$ENV_EXPECT\"" <<<"$json" && ok "environment=$ENV_EXPECT" || ng "environment mismatch (expected $ENV_EXPECT)"
 fi
 if [ "$DEEP" = 1 ]; then
   d=$(req -w '\n%{http_code}' "$BASE/healthz?deep=1" || true)
@@ -60,8 +63,8 @@ fi
 
 # 2. Top page + security headers
 hdrs=$(req -D - -o /dev/null "$BASE/")
-echo "$hdrs" | head -1 | grep -q ' 200' && ok "GET / 200" || ng "GET / not 200"
-echo "$hdrs" | grep -qi '^content-security-policy:' && ok "CSP header present" || ng "CSP header missing"
+[[ "${hdrs%%$'\n'*}" == *" 200"* ]] && ok "GET / 200" || ng "GET / not 200"
+grep -qi '^content-security-policy:' <<<"$hdrs" && ok "CSP header present" || ng "CSP header missing"
 
 # 3. Redirect of the pre-seeded smoke link
 loc=$(req -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE/SmokeT1")
@@ -79,10 +82,12 @@ host=$(printf '%s' "$BASE" | sed -E 's#^https?://([^/:]+).*#\1#')
 c=$(post "{\"url\":\"https://$host/SmokeT1\"}"); [ "$c" = 400 ] && ok "recursive rejected (400)" || ng "recursive returned $c"
 
 # 6. AI entry points (read-only: nothing is created)
-c=$(req -o /dev/null -w '%{http_code}' "$BASE/llms.txt"); [ "$c" = 200 ] && req "$BASE/llms.txt" | grep -q "/api/shorten?url=" && ok "llms.txt served" || ng "llms.txt returned $c"
-req "$BASE/openapi.json" | grep -q '"openapi": "3.1.0"' && ok "openapi.json served" || ng "openapi.json missing or invalid"
+llms=$(req -w '\n%{http_code}' "$BASE/llms.txt"); c=${llms##*$'\n'}
+[ "$c" = 200 ] && grep -q "/api/shorten?url=" <<<"$llms" && ok "llms.txt served" || ng "llms.txt returned $c"
+oa=$(req -w '\n%{http_code}' "$BASE/openapi.json"); c=${oa##*$'\n'}
+[ "$c" = 200 ] && grep -q '"openapi": "3.1.0"' <<<"$oa" && ok "openapi.json served" || ng "openapi.json returned $c"
 mcp=$(req -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$BASE/mcp")
-printf '%s' "$mcp" | grep -q '"name":"shorten_url"' && ok "MCP tools/list exposes shorten_url" || ng "MCP tools/list failed: $mcp"
+grep -q '"name":"shorten_url"' <<<"$mcp" && ok "MCP tools/list exposes shorten_url" || ng "MCP tools/list failed: $mcp"
 c=$(req -o /dev/null -w '%{http_code}' -H 'Sec-Fetch-Site: cross-site' -H 'Sec-Fetch-Dest: image' "$BASE/api/shorten?url=https%3A%2F%2Fexample.com%2F")
 [ "$c" = 403 ] && ok "GET API refuses cross-site embedding (403)" || ng "cross-site GET returned $c"
 
@@ -93,7 +98,7 @@ if [ "$WRITE" = 1 ]; then
   code=${resp##*$'\n'}; json=${resp%$'\n'*}
   short=$(printf '%s' "$json" | sed -n 's/.*"short_url":"\([^"]*\)".*/\1/p')
   scode=$(printf '%s' "$json" | sed -n 's/.*"code":"\([^"]*\)".*/\1/p')
-  if [ "$code" = 201 ] && printf '%s' "$scode" | grep -Eq '^[0-9A-Za-z]{7}$'; then
+  if [ "$code" = 201 ] && [[ "$scode" =~ ^[0-9A-Za-z]{7}$ ]]; then
     ok "issued $short"
     loc=""
     for _ in 1 2 3 4 5 6; do # KV is eventually consistent across POPs
@@ -107,11 +112,11 @@ if [ "$WRITE" = 1 ]; then
   # Same URL through the GET API and MCP must return the same code (no new link).
   enc=$(printf '%s' "$target" | sed -e 's/%/%25/g' -e 's/:/%3A/g' -e 's#/#%2F#g' -e 's/?/%3F/g' -e 's/=/%3D/g' -e 's/&/%26/g')
   g=$(req "$BASE/api/shorten?url=$enc")
-  printf '%s' "$g" | grep -q "\"code\":\"$scode\"" && printf '%s' "$g" | grep -q '"created":false' \
+  grep -q "\"code\":\"$scode\"" <<<"$g" && grep -q '"created":false' <<<"$g" \
     && ok "GET API returns the existing code for the same URL" || ng "GET API dedupe failed: $g"
   m=$(req -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
       -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"shorten_url\",\"arguments\":{\"url\":\"$target\"}}}" "$BASE/mcp")
-  printf '%s' "$m" | grep -q "\"code\":\"$scode\"" && ok "MCP shorten_url returns the same short URL" || ng "MCP tools/call failed: $m"
+  grep -q "\"code\":\"$scode\"" <<<"$m" && ok "MCP shorten_url returns the same short URL" || ng "MCP tools/call failed: $m"
   c=$(post '{"url":"http://testsafebrowsing.appspot.com/s/malware.html"}')
   [ "$c" = 422 ] && ok "Safe Browsing test malware URL rejected (422)" || wn "malware test URL returned $c (expected 422)"
 fi
