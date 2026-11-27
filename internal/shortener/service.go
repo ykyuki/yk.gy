@@ -48,6 +48,10 @@ type Service struct {
 	MaxAttempts int              // 0 => DefaultMaxAttempts
 }
 
+// reservedPaths are 7-character paths served by pages/endpoints. They have
+// the shape of a short code, so such codes are never issued.
+var reservedPaths = map[string]bool{"healthz": true, "privacy": true}
+
 // Result is a successful registration.
 type Result struct {
 	Code string
@@ -101,6 +105,9 @@ func (s *Service) Shorten(ctx context.Context, rawURL string) (Result, error) {
 		code, err := NewCode(s.Rand)
 		if err != nil {
 			return Result{}, errors.Join(ErrStorage, err)
+		}
+		if reservedPaths[code] {
+			continue // would be shadowed by a page route
 		}
 		err = s.Store.Create(ctx, code, link)
 		switch {

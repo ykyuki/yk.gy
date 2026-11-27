@@ -3,6 +3,7 @@
 User-agent: *
 Allow: /$
 Allow: /llms.txt
+Allow: /privacy
 Allow: /openapi.json
 Disallow: /
 
@@ -12,6 +13,7 @@ User-agent: Claude-User
 User-agent: Perplexity-User
 Allow: /$
 Allow: /llms.txt
+Allow: /privacy
 Allow: /openapi.json
 Allow: /api/shorten
 Disallow: /
