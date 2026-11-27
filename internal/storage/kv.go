@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/fastly/compute-sdk-go/cache/simple"
@@ -43,31 +44,39 @@ func (s *KVStore) Ping() error {
 
 // Get implements Store.
 func (s *KVStore) Get(ctx context.Context, code string) (*Link, error) {
+	var b []byte
+	var err error
 	if s.CacheTTL > 0 {
-		rc, err := simple.GetOrSet([]byte("link:v1:"+code), func() (simple.CacheEntry, error) {
-			b, err := s.read(code)
-			if err != nil {
-				return simple.CacheEntry{}, err
-			}
-			return simple.CacheEntry{Body: bytes.NewReader(b), TTL: s.CacheTTL}, nil
-		})
-		if err == nil {
-			defer rc.Close()
-			b, rerr := io.ReadAll(io.LimitReader(rc, maxRecordSize))
-			if rerr == nil {
-				return Decode(b)
-			}
-		}
-		if errors.Is(err, ErrNotFound) {
-			return nil, ErrNotFound
-		}
-		// Any cache failure falls through to a direct KV read.
+		b, err = s.cachedRead(code)
+	} else {
+		b, err = s.read(code)
 	}
-	b, err := s.read(code)
 	if err != nil {
 		return nil, err
 	}
 	return Decode(b)
+}
+
+// cachedRead reads key through the per-POP Simple Cache (successful reads
+// only; misses are not cached). Any cache failure falls back to KV.
+func (s *KVStore) cachedRead(key string) ([]byte, error) {
+	rc, err := simple.GetOrSet([]byte("kv:v1:"+key), func() (simple.CacheEntry, error) {
+		b, err := s.read(key)
+		if err != nil {
+			return simple.CacheEntry{}, err
+		}
+		return simple.CacheEntry{Body: bytes.NewReader(b), TTL: s.CacheTTL}, nil
+	})
+	if err == nil {
+		defer rc.Close()
+		if b, rerr := io.ReadAll(io.LimitReader(rc, maxRecordSize)); rerr == nil {
+			return b, nil
+		}
+	}
+	if errors.Is(err, ErrNotFound) {
+		return nil, ErrNotFound
+	}
+	return s.read(key)
 }
 
 func (s *KVStore) read(code string) ([]byte, error) {
@@ -109,5 +118,39 @@ func (s *KVStore) Create(ctx context.Context, code string, link Link) error {
 		return ErrExists
 	default:
 		return fmt.Errorf("%w: insert: %v", ErrUnavailable, err)
+	}
+}
+
+// LookupURL implements Store. Index entries are immutable, so they share the
+// per-POP read cache with links.
+func (s *KVStore) LookupURL(ctx context.Context, normalizedURL string) (string, error) {
+	key := URLIndexKey(normalizedURL)
+	var b []byte
+	var err error
+	if s.CacheTTL > 0 {
+		b, err = s.cachedRead(key)
+	} else {
+		b, err = s.read(key)
+	}
+	if err != nil {
+		return "", err
+	}
+	return string(bytes.TrimSpace(b)), nil
+}
+
+// IndexURL implements Store with InsertModeAdd (never overwrites).
+func (s *KVStore) IndexURL(ctx context.Context, normalizedURL, code string) error {
+	st, err := s.open()
+	if err != nil {
+		return err
+	}
+	err = st.InsertWithConfig(URLIndexKey(normalizedURL), strings.NewReader(code), &kvstore.InsertConfig{Mode: kvstore.InsertModeAdd})
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, kvstore.ErrPreconditionFailed):
+		return ErrExists
+	default:
+		return fmt.Errorf("%w: index insert: %v", ErrUnavailable, err)
 	}
 }

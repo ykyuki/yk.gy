@@ -25,6 +25,7 @@ URLを入力すると 7 文字（Base62）の短縮URLを発行し、アクセ�
 8. [障害時の対応](#8-障害時の対応)
 9. [環境ごとのテスト方法](#9-環境ごとのテスト方法)
 10. [セキュリティ設計](#10-セキュリティ設計)
+    - [AI から使う（ChatGPT / Claude / MCP / API）](#ai-から使うchatgpt--claude--mcp--api)
 11. [リファレンス（API・設定値・ファイル構成）](#11-リファレンス)
 
 ---
@@ -54,6 +55,9 @@ flowchart LR
 | `GET /` | 埋め込み済みの 1 ページ UI（`web/`）を返す |
 | `POST /api/shorten` | ① Content-Type / Origin を確認 → ② レート制限（POP キャッシュ） → ③ URL 検証・正規化 → ④ **Safe Browsing で必ず検査（障害時は拒否＝Fail Closed）** → ⑤ 暗号学的乱数で 7 文字コードを生成 → ⑥ KV Store に **条件付き書き込み（add モード：既存キーは上書き不可）**。衝突したらコードを再生成（最大 5 回） |
 | `GET /{7文字}` | KV Store を参照して **HTTP 302**。POP 単位の Simple Cache で読み取りを高速化（TTL は環境別） |
+| `GET /api/shorten?url=…` | AI・プログラム向けの発行 API（GET）。処理は POST と同じで、同じ URL なら既存のコードを返す。他サイトに埋め込まれた読み込み（`Sec-Fetch-Site: cross-site`）は拒否 |
+| `POST /mcp` | リモート MCP サーバー（ツール `shorten_url`、認証なし、ステートレス） |
+| `GET /llms.txt` / `GET /openapi.json` | AI 向けの使い方（[llms.txt](https://llmstxt.org/)）と OpenAPI 3.1 の定義 |
 | `GET /healthz` | 稼働状況（環境名、コミット SHA、Fastly バージョン、各ストアの接続）。`?deep=1` を付けると Safe Browsing への接続と API キーも検査する（書き込みなし） |
 
 ### 環境の切り替え方
@@ -602,6 +606,33 @@ curl -si http://127.0.0.1:7676/Example
 
 ## 10. セキュリティ設計
 
+### AI から使う（ChatGPT / Claude / MCP / API）
+
+ChatGPT や Claude に「このURLを yk.gy で短縮して」と頼めば、短縮 URL を作れるようにしています。どの方法も**認証や API キーは不要**で、**同じ URL には常に同じ短縮 URL** を返します（何度呼ばれてもデータは増えません）。
+
+| 使い方 | 向いているもの | 設定 |
+|---|---|---|
+| **MCP コネクター**（`https://yk.gy/mcp`） | ChatGPT（Business / Enterprise / Edu / Pro の「カスタム MCP サーバー」）、Claude（カスタムコネクター）、MCP 対応のエージェント | AI の設定画面で URL を追加する。ツール名は `shorten_url` |
+| **カスタム GPT の Actions**（`https://yk.gy/openapi.json`） | ChatGPT のカスタム GPT | GPT の「アクション」でスキーマの URL を読み込み、認証は「なし」 |
+| **GET API**（`https://yk.gy/api/shorten?url=<URLエンコードしたURL>`） | ブラウジングできる AI、curl、Claude Code などのコーディングエージェント、スクリプト | 不要 |
+| **llms.txt**（`https://yk.gy/llms.txt`） | 使い方を AI に読ませる | 不要 |
+
+```bash
+curl "https://yk.gy/api/shorten?url=https%3A%2F%2Fexample.com%2Flong%2Fpage&format=text"
+```
+
+**各 AI の制約（2026年11月時点の公式ドキュメント）**
+- **Claude のウェブ取得機能**は、会話に出てきた URL しか開けません。AI が自分で API の URL を組み立てて開くことはできないため、Claude から使うときは **MCP コネクター**を追加してください。
+- **ChatGPT** で確実に使えるのは、MCP コネクター（Business / Enterprise / Edu、Pro）とカスタム GPT の Actions です。通常のチャットのブラウジングで API の URL を開けるかは、公式には書かれていません。
+- MCP は、最新のステートレス仕様（2026-07-28：`server/discover` と各リクエストの `_meta`）と、従来の接続手順（`initialize` / `ping`。2025-11-25・2025-06-18・2025-03-26）の両方に対応しています。セッション ID は発行しません。
+
+**悪用対策**
+- 作成を伴う GET が他サイトの `<img>` などから呼ばれないよう、ブラウザが付ける `Sec-Fetch-Site` が `cross-site` / `same-site` のリクエストは 403 で拒否します（AI やプログラムはこのヘッダーを送りません）。`HEAD` では何も作成しません。
+- robots.txt で、検索エンジンや学習用のクローラーには API を開放せず、ユーザーの指示で動くエージェント（`ChatGPT-User` / `Claude-User` / `Perplexity-User`）にだけ許可しています。API の応答には `X-Robots-Tag: noindex` を付けます。
+- GET・POST・MCP のすべてで、同じレート制限と同じ検査（URL 検証、Safe Browsing）を通ります。ChatGPT などのサーバーから来るリクエストは、少数の IP にまとまることがあります。利用者が増えて 429 が増えたら、本番の `ratelimit_per_minute` を上げてください。
+- 運営者が無効化した URL（`disabled: true`）は、新しいコードで登録し直すこともできません（410 `disabled_url`）。
+
+
 | 対策 | 実装 |
 |---|---|
 | 悪性URLの判定 | Google Safe Browsing API v5 `urls:search`。登録時に**必ず**検査する。API エラー、200 以外の応答、不正な JSON、キー未設定のいずれでも登録を拒否（Fail Closed） |
@@ -666,7 +697,8 @@ SSRF について：このサービスは登録されたURLに**自分からア�
 
 ### KV Store のレコード
 
-キーは 7 文字のコード、値は次の形式です。
+キーが `u:<URL の SHA-256（base64url）>` のエントリは、同じ URL に同じコードを返すための索引です（値はコード。上書きしない）。
+キーが 7 文字のコードのエントリはリンク本体で、値は次の形式です。
 
 ```json
 {"url":"https://...","created_at":"2026-11-27T00:00:00Z","disabled":false}

@@ -146,8 +146,8 @@ func TestShortenRejectsCrossSite(t *testing.T) {
 	if w := do(e.h, "POST", "/api/shorten", "application/json", `{"url":"https://a.com"}`, map[string]string{"Origin": "https://evil.example"}); w.Code != 403 {
 		t.Errorf("foreign origin: %d", w.Code)
 	}
-	if w := do(e.h, "GET", "/api/shorten", "", "", nil); w.Code != 405 {
-		t.Errorf("GET api: %d", w.Code)
+	if w := do(e.h, "DELETE", "/api/shorten", "", "", nil); w.Code != 405 {
+		t.Errorf("DELETE api: %d", w.Code)
 	}
 	big := `{"url":"https://a.com/` + strings.Repeat("a", 9000) + `"}`
 	if w := post(e.h, big); w.Code != 413 {
@@ -256,5 +256,123 @@ func TestDeepHealthChecksSafeBrowsingWithoutWriting(t *testing.T) {
 	}
 	if e.store.Len() != 3 {
 		t.Fatal("health checks must never write")
+	}
+}
+
+func TestGetAPI(t *testing.T) {
+	e := newEnv(t, safebrowsing.Mock{})
+	e.h.Limiter = &ratelimit.Window{Store: &ratelimit.MemoryStore{}, Policy: ratelimit.Policy{PerMinute: 100, Penalty: 300e9}}
+	u := "/api/shorten?url=" + url.QueryEscape("https://www.example.org/a?b=1&c=2")
+	w := do(e.h, "GET", u, "", "", nil)
+	var res shortenResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+	if w.Code != 201 || !res.Created || res.URL != "https://www.example.org/a?b=1&c=2" || w.HeaderMap.Get("X-Robots-Tag") == "" {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	// Same URL again: 200 with the same code, nothing new stored.
+	n := e.store.Len()
+	w = do(e.h, "GET", u, "", "", nil)
+	var again shortenResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &again)
+	if w.Code != 200 || again.Created || again.Code != res.Code || e.store.Len() != n {
+		t.Fatalf("dedupe: %d %s", w.Code, w.Body.String())
+	}
+	// Plain text format.
+	w = do(e.h, "GET", u+"&format=text", "", "", nil)
+	if w.Code != 200 || w.Body.String() != "https://yk.gy/"+res.Code+"\n" || !strings.HasPrefix(w.HeaderMap.Get("Content-Type"), "text/plain") {
+		t.Fatalf("text: %d %q", w.Code, w.Body.String())
+	}
+	w = do(e.h, "GET", "/api/shorten?format=text&url="+url.QueryEscape("javascript:alert(1)"), "", "", nil)
+	if w.Code != 400 || !strings.HasPrefix(w.Body.String(), "error: unsupported_scheme") {
+		t.Fatalf("text error: %d %q", w.Code, w.Body.String())
+	}
+	if w := do(e.h, "GET", "/api/shorten", "", "", nil); w.Code != 400 || errCode(t, w) != "missing_url" {
+		t.Fatalf("missing url: %d", w.Code)
+	}
+}
+
+func TestGetAPIRefusesCrossSiteAndHead(t *testing.T) {
+	e := newEnv(t, safebrowsing.Mock{})
+	e.h.Limiter = &ratelimit.Window{Store: &ratelimit.MemoryStore{}, Policy: ratelimit.Policy{PerMinute: 100, Penalty: 300e9}}
+	u := "/api/shorten?url=" + url.QueryEscape("https://www.example.org/x")
+	for _, site := range []string{"cross-site", "same-site"} {
+		w := do(e.h, "GET", u, "", "", map[string]string{"Sec-Fetch-Site": site, "Sec-Fetch-Dest": "image"})
+		if w.Code != 403 || errCode(t, w) != "cross_site_request" {
+			t.Fatalf("%s: %d", site, w.Code)
+		}
+	}
+	if w := do(e.h, "HEAD", u, "", "", nil); w.Code != 405 {
+		t.Fatalf("HEAD must not create: %d", w.Code)
+	}
+	if e.store.Len() != 3 {
+		t.Fatal("refused requests must not store anything")
+	}
+	for _, site := range []string{"none", "same-origin"} {
+		if w := do(e.h, "GET", u, "", "", map[string]string{"Sec-Fetch-Site": site}); w.Code != 201 && w.Code != 200 {
+			t.Fatalf("%s: %d", site, w.Code)
+		}
+	}
+}
+
+func TestGetAPIIsRateLimited(t *testing.T) {
+	e := newEnv(t, safebrowsing.Mock{})
+	for i := 0; i < 3; i++ {
+		do(e.h, "GET", "/api/shorten?url="+url.QueryEscape("https://example.org/"+string(rune('a'+i))), "", "", nil)
+	}
+	if w := do(e.h, "GET", "/api/shorten?url="+url.QueryEscape("https://example.org/z"), "", "", nil); w.Code != 429 {
+		t.Fatalf("expected 429, got %d", w.Code)
+	}
+}
+
+func TestDocsForAI(t *testing.T) {
+	e := newEnv(t, safebrowsing.Mock{})
+	w := do(e.h, "GET", "/llms.txt", "", "", nil)
+	body := w.Body.String()
+	if w.Code != 200 || !strings.HasPrefix(body, "# yk.gy\n") || !strings.Contains(body, "https://yk.gy/api/shorten?url=") || !strings.Contains(w.HeaderMap.Get("Content-Type"), "markdown") {
+		t.Fatalf("llms.txt: %d %s", w.Code, body)
+	}
+	w = do(e.h, "GET", "/openapi.json", "", "", nil)
+	var doc map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &doc); err != nil || doc["openapi"] != "3.1.0" {
+		t.Fatalf("openapi: %v %s", err, w.Body.String())
+	}
+	if doc["servers"].([]any)[0].(map[string]any)["url"] != "https://yk.gy" {
+		t.Fatal("servers must use the environment's base URL")
+	}
+	get := doc["paths"].(map[string]any)["/api/shorten"].(map[string]any)["get"].(map[string]any)
+	if get["operationId"] != "shortenUrl" {
+		t.Fatal("operationId")
+	}
+}
+
+func TestMCPEndToEnd(t *testing.T) {
+	e := newEnv(t, safebrowsing.Mock{})
+	call := `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"shorten_url","arguments":{"url":"https://www.example.org/mcp"}}}`
+	w := do(e.h, "POST", "/mcp", "application/json", call, map[string]string{"Accept": "application/json, text/event-stream"})
+	var m struct {
+		Result struct {
+			IsError           bool              `json:"isError"`
+			StructuredContent map[string]any    `json:"structuredContent"`
+			Content           []json.RawMessage `json:"content"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil || w.Code != 200 || m.Result.IsError {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	short, _ := m.Result.StructuredContent["short_url"].(string)
+	if !strings.HasPrefix(short, "https://yk.gy/") || m.Result.StructuredContent["created"] != true {
+		t.Fatalf("%v", m.Result.StructuredContent)
+	}
+	// Tool errors flow through as isError results (Safe Browsing mock).
+	bad := `{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"shorten_url","arguments":{"url":"http://testsafebrowsing.appspot.com/s/malware.html"}}}`
+	w = do(e.h, "POST", "/mcp", "application/json", bad, nil)
+	if !strings.Contains(w.Body.String(), `"isError":true`) || !strings.Contains(w.Body.String(), "unsafe_url") {
+		t.Fatalf("%s", w.Body.String())
+	}
+	if w := do(e.h, "GET", "/mcp", "", "", nil); w.Code != 405 {
+		t.Fatalf("GET /mcp: %d", w.Code)
+	}
+	if w := do(e.h, "POST", "/mcp", "application/json", call, map[string]string{"Origin": "https://evil.example"}); w.Code != 403 {
+		t.Fatalf("foreign origin: %d", w.Code)
 	}
 }

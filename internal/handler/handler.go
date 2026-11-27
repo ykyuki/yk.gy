@@ -57,12 +57,18 @@ func (h *Handler) ServeHTTP(ctx context.Context, w fsthttp.ResponseWriter, r *fs
 
 	switch {
 	case path == "/api/shorten":
-		if r.Method != fsthttp.MethodPost {
-			w.Header().Set("Allow", "POST")
-			h.jsonError(w, fsthttp.StatusMethodNotAllowed, "method_not_allowed", "POSTメソッドを使用してください")
-			return
+		switch r.Method {
+		case fsthttp.MethodPost:
+			h.shorten(ctx, w, r)
+		case fsthttp.MethodGet, fsthttp.MethodHead:
+			h.shortenGet(ctx, w, r)
+		default:
+			w.Header().Set("Allow", "GET, POST")
+			h.jsonError(w, fsthttp.StatusMethodNotAllowed, "method_not_allowed", "GET または POST を使用してください")
 		}
-		h.shorten(ctx, w, r)
+		return
+	case path == "/mcp":
+		h.mcp(ctx, w, r)
 		return
 	case path == "/healthz":
 		h.health(ctx, w, r)
@@ -81,6 +87,12 @@ func (h *Handler) ServeHTTP(ctx context.Context, w fsthttp.ResponseWriter, r *fs
 		return
 	case "/style.css", "/app.js", "/favicon.svg", "/robots.txt":
 		h.asset(w, r, strings.TrimPrefix(path, "/"))
+		return
+	case "/llms.txt":
+		h.llmsTxt(w, r)
+		return
+	case "/openapi.json", "/.well-known/openapi.json":
+		h.openAPI(w, r)
 		return
 	case "/favicon.ico":
 		w.WriteHeader(fsthttp.StatusNoContent)
@@ -139,6 +151,64 @@ type shortenResponse struct {
 	Code     string `json:"code"`
 	ShortURL string `json:"short_url"`
 	URL      string `json:"url"`
+	// Created is false when the URL had already been shortened and the
+	// existing short URL is returned.
+	Created bool `json:"created"`
+}
+
+// outcome is the transport-independent result of a shorten request, shared
+// by the HTML form API (POST), the GET API and the MCP tool.
+type outcome struct {
+	Status     int
+	Resp       *shortenResponse
+	ErrCode    string
+	ErrMsg     string
+	RetryAfter int
+}
+
+// shortenURL applies the rate limit, then validates, checks and stores
+// rawURL. Every entry point goes through here.
+func (h *Handler) shortenURL(ctx context.Context, r *fsthttp.Request, rawURL string) outcome {
+	key := ratelimit.ClientKey(r.RemoteAddr)
+	if h.Limiter != nil {
+		ok, err := h.Limiter.Allow(key)
+		if err != nil {
+			h.log(map[string]any{"event": "ratelimit_error", "error": err.Error()})
+			if !h.Config.RateLimitFailOpen {
+				return outcome{Status: fsthttp.StatusServiceUnavailable, ErrCode: "ratelimit_unavailable", ErrMsg: "現在URLを発行できません。しばらくしてから再度お試しください"}
+			}
+		} else if !ok {
+			h.log(map[string]any{"event": "rate_limited", "client": key})
+			return outcome{Status: fsthttp.StatusTooManyRequests, ErrCode: "rate_limited", ErrMsg: "リクエストが多すぎます。しばらく待ってから再度お試しください", RetryAfter: int(h.Config.RatePenalty.Seconds())}
+		}
+	}
+
+	svc := *h.Service
+	svc.Validation.ShortHosts = append(append([]string{}, svc.Validation.ShortHosts...), hostOnly(r.Host))
+	res, err := svc.Shorten(ctx, rawURL)
+	if err != nil {
+		status, code, msg := h.classifyShortenError(err)
+		return outcome{Status: status, ErrCode: code, ErrMsg: msg}
+	}
+	short := h.baseURL(r) + "/" + res.Code
+	status := fsthttp.StatusCreated
+	if res.Existing {
+		status = fsthttp.StatusOK
+	} else {
+		h.log(map[string]any{"event": "link_created", "code": res.Code, "target_host": hostOf(res.URL)})
+	}
+	return outcome{Status: status, Resp: &shortenResponse{Code: res.Code, ShortURL: short, URL: res.URL, Created: !res.Existing}}
+}
+
+func (h *Handler) writeOutcome(w fsthttp.ResponseWriter, o outcome) {
+	if o.RetryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(o.RetryAfter))
+	}
+	if o.Resp != nil {
+		h.writeJSON(w, o.Status, o.Resp)
+		return
+	}
+	h.jsonError(w, o.Status, o.ErrCode, o.ErrMsg)
 }
 
 func (h *Handler) shorten(ctx context.Context, w fsthttp.ResponseWriter, r *fsthttp.Request) {
@@ -155,23 +225,6 @@ func (h *Handler) shorten(ctx context.Context, w fsthttp.ResponseWriter, r *fsth
 	if o := r.Header.Get("Origin"); o != "" && !h.sameOrigin(o, r) {
 		h.jsonError(w, fsthttp.StatusForbidden, "forbidden_origin", "許可されていないオリジンからのリクエストです")
 		return
-	}
-
-	key := ratelimit.ClientKey(r.RemoteAddr)
-	if h.Limiter != nil {
-		ok, err := h.Limiter.Allow(key)
-		if err != nil {
-			h.log(map[string]any{"event": "ratelimit_error", "error": err.Error()})
-			if !h.Config.RateLimitFailOpen {
-				h.jsonError(w, fsthttp.StatusServiceUnavailable, "ratelimit_unavailable", "現在URLを発行できません。しばらくしてから再度お試しください")
-				return
-			}
-		} else if !ok {
-			w.Header().Set("Retry-After", strconv.Itoa(int(h.Config.RatePenalty.Seconds())))
-			h.log(map[string]any{"event": "rate_limited", "client": key})
-			h.jsonError(w, fsthttp.StatusTooManyRequests, "rate_limited", "リクエストが多すぎます。しばらく待ってから再度お試しください")
-			return
-		}
 	}
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
@@ -191,35 +244,26 @@ func (h *Handler) shorten(ctx context.Context, w fsthttp.ResponseWriter, r *fsth
 		return
 	}
 
-	svc := *h.Service
-	svc.Validation.ShortHosts = append(append([]string{}, svc.Validation.ShortHosts...), hostOnly(r.Host))
-	res, err := svc.Shorten(ctx, req.URL)
-	if err != nil {
-		h.shortenError(w, err)
-		return
-	}
-
-	short := h.baseURL(r) + "/" + res.Code
-	h.log(map[string]any{"event": "link_created", "code": res.Code, "target_host": hostOf(res.URL)})
-	h.writeJSON(w, fsthttp.StatusCreated, shortenResponse{Code: res.Code, ShortURL: short, URL: res.URL})
+	h.writeOutcome(w, h.shortenURL(ctx, r, req.URL))
 }
 
-func (h *Handler) shortenError(w fsthttp.ResponseWriter, err error) {
+func (h *Handler) classifyShortenError(err error) (status int, code, msg string) {
 	if ve, ok := validation.AsError(err); ok {
-		h.jsonError(w, fsthttp.StatusBadRequest, ve.Code, ve.Msg)
-		return
+		return fsthttp.StatusBadRequest, ve.Code, ve.Msg
 	}
 	var ue *shortener.UnsafeError
 	switch {
 	case errors.As(err, &ue):
 		h.log(map[string]any{"event": "unsafe_rejected", "threats": ue.Threats})
-		h.jsonError(w, fsthttp.StatusUnprocessableEntity, "unsafe_url", "このURLはGoogle Safe Browsingにより危険なサイトと判定されたため登録できません")
+		return fsthttp.StatusUnprocessableEntity, "unsafe_url", "このURLはGoogle Safe Browsingにより危険なサイトと判定されたため登録できません"
+	case errors.Is(err, shortener.ErrDisabled):
+		return fsthttp.StatusGone, "disabled_url", "このURLは運営者により無効化されているため登録できません"
 	case errors.Is(err, shortener.ErrCheckUnavailable):
 		h.log(map[string]any{"event": "safebrowsing_unavailable", "error": err.Error()})
-		h.jsonError(w, fsthttp.StatusServiceUnavailable, "safety_check_unavailable", "安全性の確認ができないため、現在URLを登録できません。しばらくしてから再度お試しください")
+		return fsthttp.StatusServiceUnavailable, "safety_check_unavailable", "安全性の確認ができないため、現在URLを登録できません。しばらくしてから再度お試しください"
 	default:
 		h.log(map[string]any{"event": "shorten_failed", "error": err.Error()})
-		h.jsonError(w, fsthttp.StatusServiceUnavailable, "storage_unavailable", "URLを保存できませんでした。しばらくしてから再度お試しください")
+		return fsthttp.StatusServiceUnavailable, "storage_unavailable", "URLを保存できませんでした。しばらくしてから再度お試しください"
 	}
 }
 

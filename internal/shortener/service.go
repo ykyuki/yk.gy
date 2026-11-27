@@ -27,6 +27,9 @@ var (
 	ErrStorage = errors.New("shortener: storage error")
 	// ErrNoFreeCode means every attempted code collided.
 	ErrNoFreeCode = errors.New("shortener: could not allocate a code")
+	// ErrDisabled means the URL was taken down by an operator; it cannot be
+	// shortened again under a new code.
+	ErrDisabled = errors.New("shortener: url was disabled by an operator")
 )
 
 // UnsafeError carries the threat types returned by Safe Browsing.
@@ -49,6 +52,9 @@ type Service struct {
 type Result struct {
 	Code string
 	URL  string
+	// Existing is true when the URL had been shortened before and its
+	// existing code was returned (no Safe Browsing call, no write).
+	Existing bool
 }
 
 // Shorten validates rawURL, checks it with Safe Browsing (always, fail
@@ -58,6 +64,19 @@ func (s *Service) Shorten(ctx context.Context, rawURL string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+
+	// Same URL -> same code. This keeps repeated or automated requests (AI
+	// agents, GET API, MCP) from creating duplicates, writing to storage or
+	// spending Safe Browsing quota. Lookup failures just skip the shortcut.
+	if code, err := s.Store.LookupURL(ctx, normalized); err == nil && IsValidCode(code) {
+		if l, err := s.Store.Get(ctx, code); err == nil && l.URL == normalized {
+			if l.Disabled {
+				return Result{}, ErrDisabled
+			}
+			return Result{Code: code, URL: normalized, Existing: true}, nil
+		}
+	}
+
 	if s.Checker == nil {
 		return Result{}, ErrCheckUnavailable
 	}
@@ -86,6 +105,9 @@ func (s *Service) Shorten(ctx context.Context, rawURL string) (Result, error) {
 		err = s.Store.Create(ctx, code, link)
 		switch {
 		case err == nil:
+			// Best effort: if the index write fails the link still works; a
+			// later request for the same URL may then get a second code.
+			_ = s.Store.IndexURL(ctx, normalized, code)
 			return Result{Code: code, URL: normalized}, nil
 		case errors.Is(err, storage.ErrExists):
 			continue // collision: generate another code
