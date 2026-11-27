@@ -376,3 +376,27 @@ func TestMCPEndToEnd(t *testing.T) {
 		t.Fatalf("foreign origin: %d", w.Code)
 	}
 }
+
+func TestNoindexOutsideProduction(t *testing.T) {
+	paths := []string{"/", "/llms.txt", "/openapi.json", "/Example", "/Nope123", "/healthz"}
+	e := newEnv(t, safebrowsing.Mock{})
+	e.h.Assets["robots.txt"] = Asset{ContentType: "text/plain", Body: []byte("User-agent: *")}
+	for _, env := range []string{"development", "local", "unknown", ""} {
+		e.h.Config.Environment = env
+		for _, p := range paths {
+			if w := do(e.h, "GET", p, "", "", nil); !strings.Contains(w.HeaderMap.Get("X-Robots-Tag"), "noindex") {
+				t.Errorf("env=%q %s: missing noindex", env, p)
+			}
+		}
+	}
+	e.h.Config.Environment = "production"
+	for _, p := range []string{"/", "/llms.txt", "/openapi.json"} {
+		if got := do(e.h, "GET", p, "", "", nil).HeaderMap.Get("X-Robots-Tag"); got != "" {
+			t.Errorf("production %s must be indexable, got %q", p, got)
+		}
+	}
+	// The API stays noindex everywhere.
+	if got := do(e.h, "GET", "/api/shorten", "", "", nil).HeaderMap.Get("X-Robots-Tag"); !strings.Contains(got, "noindex") {
+		t.Errorf("production API must stay noindex, got %q", got)
+	}
+}

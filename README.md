@@ -8,6 +8,8 @@ URLを入力すると 7 文字（Base62）の短縮URLを発行し、アクセ�
 | Development | https://dev.yk.gy | `dev` | `yk-gy-development`（開発専用） | `dev` への push / merge 後、CI 成功時に自動 |
 | Local | http://localhost:7676 | `feature/*`, `dev` | なし（Viceroy） | `fastly compute serve` |
 
+本番（yk.gy）以外の環境は、すべての応答に `X-Robots-Tag: noindex, nofollow` を付けて検索エンジンに載らないようにしています。robots.txt はクロールを許可したままにしています（クロールを禁止すると、この指示自体を読めなくなるため）。
+
 > [!IMPORTANT]
 > **Google Safe Browsing API は非商用用途向けです。** Google の規約では、別途契約がない限り Safe Browsing API を商用目的で使用できません。商用で運用する場合は [Web Risk API](https://cloud.google.com/web-risk) への切り替えを検討してください（`internal/safebrowsing` のクライアントを差し替えるだけで対応できる構成です）。また、Google は urls:search に送信された URL を自社サービスの改善に利用することがあります。
 

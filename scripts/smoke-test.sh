@@ -65,6 +65,13 @@ fi
 hdrs=$(req -D - -o /dev/null "$BASE/")
 [[ "${hdrs%%$'\n'*}" == *" 200"* ]] && ok "GET / 200" || ng "GET / not 200"
 grep -qi '^content-security-policy:' <<<"$hdrs" && ok "CSP header present" || ng "CSP header missing"
+if [ -n "$ENV_EXPECT" ]; then
+  if [ "$ENV_EXPECT" = production ]; then
+    grep -qi '^x-robots-tag:.*noindex' <<<"$hdrs" && ng "production top page must be indexable" || ok "production top page indexable"
+  else
+    grep -qi '^x-robots-tag:.*noindex' <<<"$hdrs" && ok "non-production is noindex" || ng "non-production top page lacks X-Robots-Tag: noindex"
+  fi
+fi
 
 # 3. Redirect of the pre-seeded smoke link
 loc=$(req -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE/SmokeT1")

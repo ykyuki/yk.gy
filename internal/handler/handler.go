@@ -122,6 +122,12 @@ func (h *Handler) securityHeaders(w fsthttp.ResponseWriter) {
 	if h.Config.Environment != "" {
 		hd.Set("X-Environment", h.Config.Environment)
 	}
+	// Only production may be indexed by search engines. Development and
+	// local copies are noindex on every response; robots.txt keeps allowing
+	// crawlers to fetch them so they can actually see this header.
+	if h.Config.Environment != "production" {
+		hd.Set("X-Robots-Tag", "noindex, nofollow")
+	}
 }
 
 func (h *Handler) asset(w fsthttp.ResponseWriter, r *fsthttp.Request, name string) {
