@@ -1,13 +1,17 @@
 // Package safebrowsing checks URLs against the Google Safe Browsing API v5
 // (urls:search). Any failure is reported as an error so that callers can
 // fail closed.
+//
+// The v5 API only speaks protobuf: it ignores "Accept: application/json"
+// and rejects alt=json with 400 "Unsupported Output Format". Responses are
+// therefore decoded with protowire (see proto.go).
 package safebrowsing
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
 	"net/url"
 	"strings"
 )
@@ -36,10 +40,17 @@ type Checker interface {
 	Check(ctx context.Context, rawURL string) (Verdict, error)
 }
 
+// Response is a raw HTTP response.
+type Response struct {
+	Status      int
+	ContentType string
+	Body        []byte
+}
+
 // HTTPDoer performs a GET request. It is implemented with fsthttp on
 // Fastly (cmd/shortener) and with fakes in tests.
 type HTTPDoer interface {
-	Get(ctx context.Context, url string, header map[string]string) (status int, body []byte, err error)
+	Get(ctx context.Context, url string, header map[string]string) (Response, error)
 }
 
 // Client is the live Safe Browsing v5 client.
@@ -49,20 +60,13 @@ type Client struct {
 	Endpoint string // optional override (tests)
 }
 
-type searchResponse struct {
-	Threats []struct {
-		URL         string   `json:"url"`
-		ThreatTypes []string `json:"threatTypes"`
-	} `json:"threats"`
-	CacheDuration string `json:"cacheDuration"`
-}
-
 // Check implements Checker.
 func (c *Client) Check(ctx context.Context, rawURL string) (Verdict, error) {
 	if c == nil || c.HTTP == nil {
 		return Verdict{}, fmt.Errorf("%w: client not configured", ErrUnavailable)
 	}
-	if strings.TrimSpace(c.APIKey) == "" {
+	key := strings.TrimSpace(c.APIKey)
+	if key == "" {
 		return Verdict{}, fmt.Errorf("%w: api key missing", ErrUnavailable)
 	}
 	ep := c.Endpoint
@@ -71,73 +75,35 @@ func (c *Client) Check(ctx context.Context, rawURL string) (Verdict, error) {
 	}
 	q := url.Values{}
 	q.Set("urls", rawURL)
-	// Google APIs answer in protobuf (application/x-protobuf) by default and
-	// ignore the Accept header; alt=json selects the JSON encoding.
-	q.Set("alt", "json")
 	// The API key is sent as a header rather than a query parameter so it
 	// does not end up in URL-based logs.
-	status, body, err := c.HTTP.Get(ctx, ep+"?"+q.Encode(), map[string]string{
-		"X-Goog-Api-Key": c.APIKey,
-		"Accept":         "application/json",
+	resp, err := c.HTTP.Get(ctx, ep+"?"+q.Encode(), map[string]string{
+		"X-Goog-Api-Key": key,
+		"Accept":         "application/x-protobuf",
 	})
 	if err != nil {
 		return Verdict{}, fmt.Errorf("%w: request failed: %v", ErrUnavailable, err)
 	}
-	if status != 200 {
-		return Verdict{}, fmt.Errorf("%w: http status %d: %s", ErrUnavailable, status, googleErrorReason(body))
-	}
-	if len(body) > maxResponseBytes {
+	if len(resp.Body) > maxResponseBytes {
 		return Verdict{}, fmt.Errorf("%w: response too large", ErrUnavailable)
 	}
-	var r searchResponse
-	if err := json.Unmarshal(body, &r); err != nil {
+	if resp.Status != 200 {
+		reason, msg := decodeError(resp.ContentType, resp.Body)
+		// The message is logged (it never contains the key); health endpoints
+		// only expose Reason(err), which drops everything after " | ".
+		return Verdict{}, fmt.Errorf("%w: http status %d: %s | %s", ErrUnavailable, resp.Status, reason, msg)
+	}
+	// A 200 must really be a protobuf answer from the API: an empty body is
+	// a valid "no threats" message, so anything else (an HTML error page
+	// from a proxy, JSON, ...) must not be mistaken for it.
+	if mt, _, _ := mime.ParseMediaType(resp.ContentType); mt != "application/x-protobuf" {
+		return Verdict{}, fmt.Errorf("%w: malformed response: unexpected content type %q", ErrUnavailable, resp.ContentType)
+	}
+	threats, err := decodeSearchURLsResponse(resp.Body)
+	if err != nil {
 		return Verdict{}, fmt.Errorf("%w: malformed response: %v", ErrUnavailable, err)
 	}
-	return verdictFrom(r), nil
-}
-
-func verdictFrom(r searchResponse) Verdict {
-	seen := map[string]bool{}
-	var threats []string
-	for _, t := range r.Threats {
-		for _, tt := range t.ThreatTypes {
-			if !seen[tt] {
-				seen[tt] = true
-				threats = append(threats, tt)
-			}
-		}
-		if len(t.ThreatTypes) == 0 && !seen["THREAT_TYPE_UNSPECIFIED"] {
-			// A match without a type is still a match.
-			seen["THREAT_TYPE_UNSPECIFIED"] = true
-			threats = append(threats, "THREAT_TYPE_UNSPECIFIED")
-		}
-	}
-	return Verdict{Safe: len(threats) == 0, Threats: threats}
-}
-
-// googleErrorReason extracts the machine-readable reason (e.g.
-// API_KEY_INVALID, SERVICE_DISABLED) from a Google API error body.
-func googleErrorReason(body []byte) string {
-	var e struct {
-		Error struct {
-			Status  string `json:"status"`
-			Details []struct {
-				Reason string `json:"reason"`
-			} `json:"details"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(body, &e) != nil {
-		return "unknown"
-	}
-	for _, d := range e.Error.Details {
-		if d.Reason != "" {
-			return d.Reason
-		}
-	}
-	if e.Error.Status != "" {
-		return e.Error.Status
-	}
-	return "unknown"
+	return Verdict{Safe: len(threats) == 0, Threats: threats}, nil
 }
 
 // Reason returns a short, non-sensitive classification of a check error,
@@ -162,6 +128,9 @@ func Reason(err error) string {
 			fmt.Sscanf(rest, "%d", &code)
 			if j := strings.Index(rest, ": "); j >= 0 {
 				reason = rest[j+2:]
+				if k := strings.Index(reason, " | "); k >= 0 {
+					reason = reason[:k]
+				}
 			}
 		}
 		r := fmt.Sprintf("http_status_%d", code)

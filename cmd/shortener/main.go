@@ -130,12 +130,12 @@ func commit() string {
 // fastlyHTTP sends requests to a static Fastly backend, bypassing the cache.
 type fastlyHTTP struct{ backend string }
 
-func (f fastlyHTTP) Get(ctx context.Context, url string, header map[string]string) (int, []byte, error) {
+func (f fastlyHTTP) Get(ctx context.Context, url string, header map[string]string) (safebrowsing.Response, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	req, err := fsthttp.NewRequest(fsthttp.MethodGet, url, nil)
 	if err != nil {
-		return 0, nil, err
+		return safebrowsing.Response{}, err
 	}
 	for k, v := range header {
 		req.Header.Set(k, v)
@@ -143,12 +143,12 @@ func (f fastlyHTTP) Get(ctx context.Context, url string, header map[string]strin
 	req.CacheOptions.Pass = true
 	resp, err := req.Send(ctx, f.backend)
 	if err != nil {
-		return 0, nil, err
+		return safebrowsing.Response{}, err
 	}
 	defer resp.Body.Close()
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20+1))
 	if err != nil {
-		return 0, nil, err
+		return safebrowsing.Response{}, err
 	}
-	return resp.StatusCode, b, nil
+	return safebrowsing.Response{Status: resp.StatusCode, ContentType: resp.Header.Get("Content-Type"), Body: b}, nil
 }

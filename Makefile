@@ -23,6 +23,18 @@ dev: ## Start the local server with auto-rebuild (http://localhost:7676)
 serve: ## Start the local server without file watching
 	fastly compute serve
 
+.PHONY: dev-live
+dev-live: ## Local server using the REAL Safe Browsing API (prompts for your key, hidden)
+	@sed -e 's/^\([[:space:]]*\)safebrowsing_mode = "mock"/\1safebrowsing_mode = "live"/' \
+	     -e 's/^\([[:space:]]*\)environment = "local"/\1environment = "local-live"/' \
+	     fastly.toml > fastly.live.toml
+	@grep -q 'safebrowsing_mode = "live"' fastly.live.toml || { echo "failed to generate fastly.live.toml"; exit 1; }
+	@if [ -z "$$SAFE_BROWSING_API_KEY" ]; then \
+	  read -rsp "Safe Browsing API key (input hidden; use a DEV key, never production): " SAFE_BROWSING_API_KEY; echo; \
+	fi; \
+	test -n "$$SAFE_BROWSING_API_KEY" || { echo "no key given"; exit 1; }; \
+	SAFE_BROWSING_API_KEY="$$SAFE_BROWSING_API_KEY" fastly compute serve --env live
+
 .PHONY: build
 build: ## Build the Wasm package (pkg/yk-gy.tar.gz)
 	fastly compute build

@@ -136,12 +136,33 @@ fastly compute serve
 
 ### ローカルで本物の Safe Browsing を使う（任意）
 
-1. `fastly.toml` の `safebrowsing_mode` を `"live"` に変更します（この変更はコミットしないでください）。
-2. **自分の開発用キー**を環境変数で渡して起動します。本番用キーは使わないでください。
+**開発用の API キー**を使い、本物の Google Safe Browsing API に問い合わせて動かせます。本番用のキーは使わないでください。
 
 ```bash
-read -rs SAFE_BROWSING_API_KEY && export SAFE_BROWSING_API_KEY && fastly compute serve
+make dev-live
 ```
+
+- 起動時にキーを聞かれます。入力は画面に表示されず、シェル履歴にも残りません。
+- `fastly.toml` を書き換える必要はありません。`fastly.toml` からモードと環境名の2行だけを差し替えた `fastly.live.toml` を自動で生成し（`.gitignore` 済み）、`fastly compute serve --env live` で起動します。
+- キーはローカルの Secret Store（環境変数 `SAFE_BROWSING_API_KEY`）にだけ渡されます。Fastly 上のストアや本番・開発のデータには一切触れません。
+- 環境名は `local-live` と表示されます。
+
+起動したら、次のコマンドでキーと接続を確認できます。
+
+```bash
+curl -s "http://localhost:7676/healthz?deep=1"
+```
+
+| `checks.safebrowsing` の値 | 意味 |
+|---|---|
+| `ok` | キーが有効で、API に正常に接続できている |
+| `error: http_status_400_API_KEY_INVALID` | キーが間違っている |
+| `error: http_status_403_SERVICE_DISABLED` | Google Cloud のプロジェクトで Safe Browsing API が有効になっていない |
+| `error: http_status_403_API_KEY_SERVICE_BLOCKED` | キーの「API の制限」で Safe Browsing API が許可されていない |
+| `error: http_status_400_INVALID_ARGUMENT` | リクエストの形式が拒否されている（ターミナルのログに詳細が出る） |
+| `error: request_failed` | ネットワークエラーなどで API に届いていない |
+
+同じ値は Dev・本番の `/healthz?deep=1` でも表示されます。キーや URL は表示されません。
 
 ### ローカル用データ
 
