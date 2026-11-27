@@ -16,12 +16,12 @@ versions() { fastly service version list --service-id "$1" --json; }
 
 case "$cmd" in
   active)
-    versions "$1" | jq -r '[.[] | select(.Active == true)][0].Number // empty';;
+    versions "$1" | jq -r '[(. // [])[] | select(.Active == true)][0].Number // empty';;
   base)
-    a=$(versions "$1" | jq -r '[.[] | select(.Active == true)][0].Number // empty')
+    a=$(versions "$1" | jq -r '[(. // [])[] | select(.Active == true)][0].Number // empty')
     if [ -n "$a" ]; then echo active; else echo latest; fi;;
   describe)
-    versions "$1" | jq --argjson v "$2" '.[] | select(.Number == $v)';;
+    versions "$1" | jq --argjson v "$2" '(. // [])[] | select(.Number == $v)';;
   good)
     env="$1"
     git fetch -q --force origin "refs/tags/deployed/$env/*:refs/tags/deployed/$env/*" 2>/dev/null || true

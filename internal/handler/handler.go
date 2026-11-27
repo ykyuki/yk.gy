@@ -290,6 +290,9 @@ func (h *Handler) health(ctx context.Context, w fsthttp.ResponseWriter, r *fstht
 			resp.Checks["safebrowsing"] = "error"
 		} else if v, err := h.Service.Checker.Check(ctx, deepCheckURL); err != nil || !v.Safe {
 			resp.Checks["safebrowsing"] = "error"
+			if err != nil {
+				h.log(map[string]any{"event": "deep_health_safebrowsing_error", "error": err.Error()})
+			}
 		} else {
 			resp.Checks["safebrowsing"] = "ok"
 		}
