@@ -4,6 +4,8 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -50,18 +52,57 @@ type Store interface {
 	// write). It returns ErrExists when the code is already taken and never
 	// overwrites an existing entry.
 	Create(ctx context.Context, code string, link Link) error
+	// LookupURL returns the code already issued for a normalized URL, or
+	// ErrNotFound.
+	LookupURL(ctx context.Context, normalizedURL string) (string, error)
+	// IndexURL records code as the code for normalizedURL. It never
+	// overwrites an existing index entry (the first code wins).
+	IndexURL(ctx context.Context, normalizedURL, code string) error
+}
+
+// URLIndexKey is the storage key of the URL -> code index entry. Short codes
+// are Base62 and never contain ':', so the keys cannot collide.
+func URLIndexKey(normalizedURL string) string {
+	sum := sha256.Sum256([]byte(normalizedURL))
+	return "u:" + base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 // MemoryStore is an in-memory Store for tests.
 type MemoryStore struct {
 	mu    sync.Mutex
 	links map[string]Link
+	index map[string]string
 	// CreateErr, if set, is returned by Create (fault injection).
 	CreateErr error
 }
 
 // NewMemoryStore returns an empty MemoryStore.
-func NewMemoryStore() *MemoryStore { return &MemoryStore{links: map[string]Link{}} }
+func NewMemoryStore() *MemoryStore {
+	return &MemoryStore{links: map[string]Link{}, index: map[string]string{}}
+}
+
+// LookupURL implements Store.
+func (m *MemoryStore) LookupURL(_ context.Context, u string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.index[URLIndexKey(u)]
+	if !ok {
+		return "", ErrNotFound
+	}
+	return c, nil
+}
+
+// IndexURL implements Store.
+func (m *MemoryStore) IndexURL(_ context.Context, u, code string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := URLIndexKey(u)
+	if _, ok := m.index[k]; ok {
+		return ErrExists
+	}
+	m.index[k] = code
+	return nil
+}
 
 // Get implements Store.
 func (m *MemoryStore) Get(_ context.Context, code string) (*Link, error) {

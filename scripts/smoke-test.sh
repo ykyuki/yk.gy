@@ -78,7 +78,15 @@ c=$(post '{"url":"http://127.0.0.1/"}');   [ "$c" = 400 ] && ok "loopback reject
 host=$(printf '%s' "$BASE" | sed -E 's#^https?://([^/:]+).*#\1#')
 c=$(post "{\"url\":\"https://$host/SmokeT1\"}"); [ "$c" = 400 ] && ok "recursive rejected (400)" || ng "recursive returned $c"
 
-# 6. Optional write test (one link to a dedicated test URL)
+# 6. AI entry points (read-only: nothing is created)
+c=$(req -o /dev/null -w '%{http_code}' "$BASE/llms.txt"); [ "$c" = 200 ] && req "$BASE/llms.txt" | grep -q "/api/shorten?url=" && ok "llms.txt served" || ng "llms.txt returned $c"
+req "$BASE/openapi.json" | grep -q '"openapi": "3.1.0"' && ok "openapi.json served" || ng "openapi.json missing or invalid"
+mcp=$(req -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$BASE/mcp")
+printf '%s' "$mcp" | grep -q '"name":"shorten_url"' && ok "MCP tools/list exposes shorten_url" || ng "MCP tools/list failed: $mcp"
+c=$(req -o /dev/null -w '%{http_code}' -H 'Sec-Fetch-Site: cross-site' -H 'Sec-Fetch-Dest: image' "$BASE/api/shorten?url=https%3A%2F%2Fexample.com%2F")
+[ "$c" = 403 ] && ok "GET API refuses cross-site embedding (403)" || ng "cross-site GET returned $c"
+
+# 7. Optional write test (one link to a dedicated test URL)
 if [ "$WRITE" = 1 ]; then
   target="https://example.com/?yk-gy-smoke=${GITHUB_RUN_ID:-local}-$(date +%s)"
   resp=$(req -w '\n%{http_code}' -H 'Content-Type: application/json' -H "Origin: $BASE" -d "{\"url\":\"$target\"}" "$BASE/api/shorten")
@@ -96,6 +104,14 @@ if [ "$WRITE" = 1 ]; then
   else
     ng "issuing link failed: $code $json"
   fi
+  # Same URL through the GET API and MCP must return the same code (no new link).
+  enc=$(printf '%s' "$target" | sed -e 's/%/%25/g' -e 's/:/%3A/g' -e 's#/#%2F#g' -e 's/?/%3F/g' -e 's/=/%3D/g' -e 's/&/%26/g')
+  g=$(req "$BASE/api/shorten?url=$enc")
+  printf '%s' "$g" | grep -q "\"code\":\"$scode\"" && printf '%s' "$g" | grep -q '"created":false' \
+    && ok "GET API returns the existing code for the same URL" || ng "GET API dedupe failed: $g"
+  m=$(req -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+      -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"shorten_url\",\"arguments\":{\"url\":\"$target\"}}}" "$BASE/mcp")
+  printf '%s' "$m" | grep -q "\"code\":\"$scode\"" && ok "MCP shorten_url returns the same short URL" || ng "MCP tools/call failed: $m"
   c=$(post '{"url":"http://testsafebrowsing.appspot.com/s/malware.html"}')
   [ "$c" = 422 ] && ok "Safe Browsing test malware URL rejected (422)" || wn "malware test URL returned $c (expected 422)"
 fi
