@@ -1,0 +1,10 @@
+# Manifest used only by the Viceroy integration tests (make test-integration).
+manifest_version = 3
+name = "yk-gy-integration"
+language = "go"
+
+[local_server]
+  [local_server.kv_stores]
+    [[local_server.kv_stores.links]]
+      key = "Existed"
+      data = "{\"url\":\"https://example.com/\",\"created_at\":\"2026-01-01T00:00:00Z\"}"

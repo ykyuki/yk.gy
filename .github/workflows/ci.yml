@@ -1,0 +1,209 @@
+# CI: format, vet, static analysis, vulnerability scan, unit tests, Wasm
+# build, Viceroy integration tests, local end-to-end smoke test, and the
+# deployable package as an artifact (package-<sha>).
+#
+# Triggers:
+#   - pull requests to dev / main (feature/*, hotfix/*, dev -> main)
+#   - push to main (builds the artifact that production deploys)
+#   - push to dev runs this workflow via deploy-dev.yml (workflow_call), so CI
+#     is not executed twice for the same commit.
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [main]
+  workflow_call:
+    outputs:
+      artifact-name:
+        description: Name of the uploaded package artifact
+        value: ${{ jobs.build.outputs.artifact-name }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  FASTLY_CLI_VERSION: "17.2.0"
+  VICEROY_VERSION: "0.22.0"
+  STATICCHECK_VERSION: "v0.8.2"
+
+jobs:
+  branch-policy:
+    name: Branch policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check source / target branch combination
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then echo "not a PR: nothing to check"; exit 0; fi
+          echo "PR: $HEAD_REF -> $BASE_REF"
+          case "$BASE_REF" in
+            main)
+              case "$HEAD_REF" in dev|hotfix/*) ;; *)
+                echo "::error::Only 'dev' or 'hotfix/*' may be merged into main (got '$HEAD_REF')."; exit 1;; esac;;
+            dev)
+              case "$HEAD_REF" in feature/*|hotfix/*|main|dependabot/*) ;; *)
+                echo "::error::Branches merged into dev must be named feature/* or hotfix/* (got '$HEAD_REF')."; exit 1;; esac;;
+          esac
+          echo "ok"
+
+  main-guard:
+    name: Main push guard
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Require that the commit on main came from a merged pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          # The repository's very first (root) commit cannot come from a PR.
+          if [ "$(gh api "repos/$REPO/commits/$SHA" --jq '.parents | length')" = 0 ]; then
+            echo "root commit: bootstrap exception"; exit 0
+          fi
+          prs=$(gh api "repos/$REPO/commits/$SHA/pulls" --jq '[.[] | select(.merged_at != null and .base.ref == "main")] | length')
+          if [ "${prs:-0}" -lt 1 ]; then
+            echo "::error::$SHA was pushed to main without a merged pull request. It will not be deployable to production."
+            exit 1
+          fi
+          echo "commit $SHA came from a merged PR"
+
+  test:
+    name: Lint & unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod   # single source of truth for the Go version
+          cache: true
+
+      - name: Download & verify modules
+        run: |
+          go mod download
+          go mod verify
+          go version
+
+      - name: go mod tidy is clean
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "::error::gofmt needed:"; echo "$out"; exit 1; fi
+
+      - name: go vet (native and wasip1)
+        run: |
+          go vet ./...
+          GOOS=wasip1 GOARCH=wasm go vet ./...
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} ./...
+
+      - name: Unit tests (race + coverage)
+        run: |
+          go test -race -covermode=atomic -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out | tail -1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Fuzz URL validator (short)
+        run: go test -run='^$' -fuzz=FuzzNormalize -fuzztime=20s ./internal/validation/
+
+      - name: govulncheck
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+        with:
+          go-version-file: go.mod
+          go-package: ./...
+
+  build:
+    name: Wasm build & integration tests
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      artifact-name: ${{ steps.meta.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Fastly CLI and Viceroy
+        uses: fastly/compute-actions/setup@a25cf83ef5c19ef7d86f1eebffcd8f6c02ddc786 # v14
+        with:
+          cli_version: ${{ env.FASTLY_CLI_VERSION }}
+          viceroy_version: ${{ env.VICEROY_VERSION }}
+          token: ${{ github.token }}
+
+      - name: fastly compute build
+        uses: fastly/compute-actions/build@a25cf83ef5c19ef7d86f1eebffcd8f6c02ddc786 # v14
+        with:
+          verbose: true
+
+      - name: Integration tests in Viceroy (KV conditional writes etc.)
+        run: |
+          VICEROY=$(command -v viceroy)
+          cd test/integration
+          GOOS=wasip1 GOARCH=wasm go test -count=1 -v -exec "$VICEROY run -C fastly.toml" .
+
+      - name: Local end-to-end smoke test (fastly compute serve)
+        run: |
+          fastly compute serve --skip-build --addr 127.0.0.1:7676 --viceroy-path "$(command -v viceroy)" > serve.log 2>&1 &
+          for i in $(seq 1 30); do curl -fs http://127.0.0.1:7676/healthz >/dev/null && break; sleep 1; done
+          scripts/smoke-test.sh http://127.0.0.1:7676 --env local --write --deep
+
+      - name: Show local server log
+        if: failure()
+        run: cat serve.log || true
+
+      - name: Package metadata
+        id: meta
+        env:
+          SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          REF: ${{ github.ref }}
+        run: |
+          sha256sum pkg/yk-gy.tar.gz | tee pkg/yk-gy.tar.gz.sha256
+          jq -n --arg sha "$SHA" --arg run "$RUN_ID" --arg ref "$REF" --arg go "$(go version)" \
+            --arg digest "$(cut -d' ' -f1 pkg/yk-gy.tar.gz.sha256)" \
+            '{commit:$sha, ci_run_id:$run, ref:$ref, go:$go, sha256:$digest, built_at:(now|todate)}' > pkg/build-info.json
+          cat pkg/build-info.json
+          echo "artifact=package-${SHA}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Package"
+            echo '```json'; cat pkg/build-info.json; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.meta.outputs.artifact }}
+          path: |
+            pkg/yk-gy.tar.gz
+            pkg/yk-gy.tar.gz.sha256
+            pkg/build-info.json
+          retention-days: 90
+          if-no-files-found: error

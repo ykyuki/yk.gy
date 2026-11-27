@@ -1,0 +1,74 @@
+//go:build wasip1
+
+// Integration tests that run inside the real Fastly Compute runtime emulator
+// (Viceroy) against a local KV Store. Run with `make test-integration`.
+package integration
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/ykyuki/yk.gy/internal/ratelimit"
+	"github.com/ykyuki/yk.gy/internal/safebrowsing"
+	"github.com/ykyuki/yk.gy/internal/shortener"
+	"github.com/ykyuki/yk.gy/internal/storage"
+)
+
+func TestKVConditionalInsert(t *testing.T) {
+	ctx := context.Background()
+	for _, ttl := range []time.Duration{0, time.Minute} {
+		s := &storage.KVStore{Name: "links", CacheTTL: ttl}
+		if err := s.Ping(); err != nil {
+			t.Fatal(err)
+		}
+		l, err := s.Get(ctx, "Existed")
+		if err != nil || l.URL != "https://example.com/" {
+			t.Fatalf("ttl=%v get existing: %+v %v", ttl, l, err)
+		}
+		// Conditional write must refuse to overwrite.
+		err = s.Create(ctx, "Existed", storage.Link{URL: "https://attacker.example.net/"})
+		if !errors.Is(err, storage.ErrExists) {
+			t.Fatalf("ttl=%v expected ErrExists, got %v", ttl, err)
+		}
+		l, _ = s.Get(ctx, "Existed")
+		if l.URL != "https://example.com/" {
+			t.Fatal("existing entry was overwritten")
+		}
+		if _, err := s.Get(ctx, "Missing"); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("ttl=%v expected ErrNotFound, got %v", ttl, err)
+		}
+	}
+}
+
+func TestShortenEndToEndOnKV(t *testing.T) {
+	ctx := context.Background()
+	kv := &storage.KVStore{Name: "links"}
+	svc := &shortener.Service{Store: kv, Checker: safebrowsing.Mock{}}
+	res, err := svc.Shorten(ctx, "https://www.fastly.com/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := svc.Resolve(ctx, res.Code)
+	if err != nil || l.URL != "https://www.fastly.com/" {
+		t.Fatalf("%+v %v", l, err)
+	}
+	if err := kv.Create(ctx, res.Code, storage.Link{URL: "https://other.example/"}); !errors.Is(err, storage.ErrExists) {
+		t.Fatalf("second insert of a fresh code must fail, got %v", err)
+	}
+}
+
+func TestMissingStoreFailsClosed(t *testing.T) {
+	kv := &storage.KVStore{Name: "not_linked"}
+	if err := kv.Create(context.Background(), "Abcdefg", storage.Link{URL: "https://a.example/"}); !errors.Is(err, storage.ErrUnavailable) {
+		t.Fatalf("expected ErrUnavailable, got %v", err)
+	}
+}
+
+func TestERLHostcallsAvailable(t *testing.T) {
+	l := ratelimit.NewERL("shorten_rc", "shorten_pb", ratelimit.Policy{PerMinute: 10, Penalty: time.Minute})
+	if _, err := l.Allow("203.0.113.1"); err != nil {
+		t.Fatalf("ERL hostcalls failed: %v", err)
+	}
+}

@@ -1,0 +1,152 @@
+# Application rollback by re-activating a previous Fastly service version.
+#
+# Fastly keeps every service version (package + configuration) immutable once
+# activated, so rolling back = activating an older version. KV Store data is
+# NOT part of a service version and is never touched: links created after the
+# rolled-back release keep working.
+#
+# - Default target: the newest known-good version older than the active one
+#   (known-good = has a deployed/<env>/vN tag, i.e. passed its smoke test).
+# - Production requires the confirmation phrase AND runs in the `production`
+#   environment (required reviewers apply when configured).
+# - History: every run is listed under Actions, recorded as a GitHub deployment
+#   of the environment, and tagged rollback/<env>/<UTC timestamp>.
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to roll back
+        required: true
+        type: choice
+        options: [development, production]
+      target_version:
+        description: "Fastly version to activate (empty = previous known-good version)"
+        required: false
+        type: string
+      confirm:
+        description: 'Production only: type "rollback-production"'
+        required: false
+        type: string
+      reason:
+        description: Reason (recorded in the history)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ inputs.environment }}   # shared with the deploy workflows
+  cancel-in-progress: false
+
+env:
+  FASTLY_CLI_VERSION: "17.2.0"
+
+jobs:
+  rollback:
+    name: Roll back ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.BASE_URL }}
+    permissions:
+      contents: write   # rollback history tag
+    env:
+      ENV_NAME: ${{ inputs.environment }}
+      SERVICE_ID: ${{ vars.FASTLY_SERVICE_ID }}
+      BASE_URL: ${{ vars.BASE_URL }}
+      TARGET_INPUT: ${{ inputs.target_version }}
+      REASON: ${{ inputs.reason }}
+    steps:
+      - name: Confirm
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$ENV_NAME" = production ] && [ "$CONFIRM" != "rollback-production" ]; then
+            echo "::error::Production rollback requires confirm=rollback-production"; exit 1
+          fi
+          [ -n "$SERVICE_ID" ] && [ -n "$BASE_URL" ] || { echo "::error::environment variables FASTLY_SERVICE_ID / BASE_URL missing"; exit 1; }
+          if [ -n "$TARGET_INPUT" ] && ! [[ "$TARGET_INPUT" =~ ^[0-9]+$ ]]; then echo "::error::target_version must be a number"; exit 1; fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Fastly CLI
+        uses: fastly/compute-actions/setup@a25cf83ef5c19ef7d86f1eebffcd8f6c02ddc786 # v14
+        with:
+          cli_version: ${{ env.FASTLY_CLI_VERSION }}
+          token: ${{ github.token }}
+
+      - name: Choose target version
+        id: plan
+        env:
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
+        run: |
+          current=$(scripts/release.sh active "$SERVICE_ID")
+          [ -n "$current" ] || { echo "::error::no active version"; exit 1; }
+          good=$(scripts/release.sh good "$ENV_NAME")
+          echo "Known-good versions (version sha):"; echo "${good:-none}"
+          if [ -n "$TARGET_INPUT" ]; then
+            target="$TARGET_INPUT"
+          else
+            target=$(echo "$good" | awk -v c="$current" '$1 < c {print $1; exit}')
+            [ -n "$target" ] || { echo "::error::no known-good version older than $current; pass target_version explicitly"; exit 1; }
+          fi
+          [ "$target" != "$current" ] || { echo "::error::version $target is already active"; exit 1; }
+          info=$(scripts/release.sh describe "$SERVICE_ID" "$target")
+          [ -n "$info" ] || { echo "::error::version $target does not exist on service"; exit 1; }
+          [ "$(echo "$info" | jq -r '.DeletedAt // empty')" = "" ] || { echo "::error::version $target is deleted"; exit 1; }
+          sha=$(echo "$good" | awk -v t="$target" '$1 == t {print $2}')
+          if [ -z "$sha" ]; then
+            sha=$(echo "$info" | jq -r '.Comment' | sed -n 's/.*git:\([0-9a-f]\{40\}\).*/\1/p')
+            echo "::warning::version $target has no known-good tag; using commit from its comment: ${sha:-unknown}"
+          fi
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "target=$target"   >> "$GITHUB_OUTPUT"
+          echo "sha=$sha"         >> "$GITHUB_OUTPUT"
+          echo "Rolling back $ENV_NAME: v$current -> v$target (commit ${sha:-unknown})"
+
+      - name: Activate target version
+        env:
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
+          TARGET: ${{ steps.plan.outputs.target }}
+        run: fastly service version activate --service-id "$SERVICE_ID" --version "$TARGET"
+
+      - name: Health check after rollback
+        env:
+          SMOKE_WAIT: "600"
+          SHA: ${{ steps.plan.outputs.sha }}
+        run: |
+          args=(--env "$ENV_NAME" --deep)
+          [ -n "$SHA" ] && args+=(--expect-commit "$SHA")
+          scripts/smoke-test.sh "$BASE_URL" "${args[@]}"
+
+      - name: Record rollback history
+        if: always() && steps.plan.outputs.target != ''
+        env:
+          CUR: ${{ steps.plan.outputs.current }}
+          TARGET: ${{ steps.plan.outputs.target }}
+          SHA: ${{ steps.plan.outputs.sha }}
+          STATUS: ${{ job.status }}
+        run: |
+          ts=$(date -u +%Y%m%dT%H%M%SZ)
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          msg="rollback $ENV_NAME v$CUR -> v$TARGET by ${GITHUB_ACTOR} ($STATUS): $REASON; run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          git tag -a "rollback/$ENV_NAME/$ts" "${SHA:-HEAD}" -m "$msg"
+          git push origin "refs/tags/rollback/$ENV_NAME/$ts" || true
+          {
+            echo "## Rollback: $ENV_NAME"
+            echo "| | |"; echo "|---|---|"
+            echo "| From | v$CUR |"
+            echo "| To | v$TARGET (commit \`${SHA:-unknown}\`) |"
+            echo "| Reason | $REASON |"
+            echo "| By | ${GITHUB_ACTOR} |"
+            echo "| Result | $STATUS |"
+            echo "| History tag | \`rollback/$ENV_NAME/$ts\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

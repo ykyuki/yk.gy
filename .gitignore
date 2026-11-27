@@ -1,0 +1,22 @@
+# Build output
+/bin/
+/pkg/
+*.wasm
+
+# Local secrets / env files (never commit)
+.env
+.env.*
+!.env.example
+*.secret
+*.pem
+*.key
+
+# Viceroy / profiling
+/profiles/
+.fastly/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+coverage.out

@@ -1,0 +1,247 @@
+# Production CD (yk.gy). Never deploys without an explicit human decision.
+#
+#   Mode A (default, works on every GitHub plan):
+#     After the dev -> main PR is merged and CI on main is green, a maintainer
+#     starts this workflow manually (Actions tab or
+#     `gh workflow run deploy-prod.yml --ref main -f confirm=deploy-production`).
+#     Typing the confirmation phrase is the approval.
+#
+#   Mode B (plans where Environment "Required reviewers" are available):
+#     Set the repository variable PROD_DEPLOY_ON_MERGE=true and add required
+#     reviewers to the `production` environment. Every push to main then
+#     queues a deploy that WAITS for a reviewer's approval in GitHub.
+#
+# In both modes the job uses the `production` environment (its own secrets),
+# deploys only the package artifact that CI built and tested for that exact
+# commit on main, and only if that commit reached main through a merged PR.
+name: Deploy Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "deploy-production" to confirm'
+        required: true
+        type: string
+      sha:
+        description: "Commit on main to deploy (default: current main HEAD)"
+        required: false
+        type: string
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  FASTLY_CLI_VERSION: "17.2.0"
+
+jobs:
+  verify:
+    name: Verify release candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      proceed: ${{ steps.gate.outputs.proceed }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      ci_run_id: ${{ steps.ci.outputs.run_id }}
+    steps:
+      - name: Gate
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          CONFIRM: ${{ inputs.confirm }}
+          ON_MERGE: ${{ vars.PROD_DEPLOY_ON_MERGE }}
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REF" != "refs/heads/main" ]; then echo "::error::Production deploys must run from main (got $REF)"; exit 1; fi
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            if [ "$CONFIRM" != "deploy-production" ]; then echo "::error::confirmation phrase mismatch"; exit 1; fi
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$ON_MERGE" = "true" ]; then
+            echo "Push to main: a deploy will be queued and wait for approval of the 'production' environment."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Push to main: not deploying automatically. Run this workflow manually to deploy." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.proceed == 'true'
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve commit
+        id: resolve
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          sha="${INPUT_SHA:-$EVENT_SHA}"
+          sha=$(git rev-parse --verify "${sha}^{commit}")
+          git merge-base --is-ancestor "$sha" origin/main || { echo "::error::$sha is not on main"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Release candidate: $sha"
+
+      - name: Require a merged pull request
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          n=$(gh api "repos/${GITHUB_REPOSITORY}/commits/$SHA/pulls" --jq '[.[] | select(.merged_at != null and .base.ref == "main")] | length')
+          [ "${n:-0}" -ge 1 ] || { echo "::error::$SHA did not reach main through a merged PR"; exit 1; }
+
+      - name: Require a successful CI run for this commit on main
+        id: ci
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          # CI may still be running right after a merge: wait up to 30 minutes.
+          for i in $(seq 1 60); do
+            run=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci.yml --branch main --event push --commit "$SHA" \
+                  --json databaseId,status,conclusion --jq '.[0]')
+            status=$(echo "$run" | jq -r '.status // "missing"'); concl=$(echo "$run" | jq -r '.conclusion // ""')
+            if [ "$status" = completed ]; then break; fi
+            echo "CI for $SHA: $status (waiting)"; sleep 30
+          done
+          if [ "$status" != completed ] || [ "$concl" != success ]; then
+            echo "::error::CI for $SHA on main is '$status/$concl'. Production requires a green CI run."; exit 1
+          fi
+          id=$(echo "$run" | jq -r .databaseId)
+          echo "run_id=$id" >> "$GITHUB_OUTPUT"
+          echo "CI run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/$id" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy to yk.gy
+    needs: [verify]
+    if: needs.verify.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production          # production-only secrets; required reviewers (if configured) approve here
+      url: ${{ vars.BASE_URL }}
+    permissions:
+      contents: write           # release tag deployed/production/vN
+      actions: read             # download the CI artifact
+    env:
+      SERVICE_ID: ${{ vars.FASTLY_SERVICE_ID }}
+      BASE_URL: ${{ vars.BASE_URL }}
+      SHA: ${{ needs.verify.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Check environment configuration
+        env:
+          HAS_TOKEN: ${{ secrets.FASTLY_API_TOKEN != '' }}
+        run: |
+          missing=""
+          [ -n "$SERVICE_ID" ] || missing="$missing FASTLY_SERVICE_ID(variable)"
+          [ -n "$BASE_URL" ]   || missing="$missing BASE_URL(variable)"
+          [ "$HAS_TOKEN" = "true" ] || missing="$missing FASTLY_API_TOKEN(secret)"
+          if [ -n "$missing" ]; then echo "::error::GitHub environment 'production' is missing:$missing"; exit 1; fi
+          case "$BASE_URL" in https://yk.gy|https://yk.gy/) ;; *)
+            echo "::error::BASE_URL for production must be https://yk.gy (got $BASE_URL)"; exit 1;; esac
+
+      - name: Download the package CI built for this commit
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package-${{ needs.verify.outputs.sha }}
+          path: pkg
+          run-id: ${{ needs.verify.outputs.ci_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify package integrity
+        run: |
+          sha256sum -c pkg/yk-gy.tar.gz.sha256
+          test "$(jq -r .commit pkg/build-info.json)" = "$SHA"
+          cat pkg/build-info.json
+
+      - name: Set up Fastly CLI
+        uses: fastly/compute-actions/setup@a25cf83ef5c19ef7d86f1eebffcd8f6c02ddc786 # v14
+        with:
+          cli_version: ${{ env.FASTLY_CLI_VERSION }}
+          token: ${{ github.token }}
+
+      - name: Record currently active version
+        id: before
+        env:
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
+        run: |
+          prev=$(scripts/release.sh active "$SERVICE_ID")
+          echo "version=$prev" >> "$GITHUB_OUTPUT"
+          echo "base=$(scripts/release.sh base "$SERVICE_ID")" >> "$GITHUB_OUTPUT"
+          echo "Previously active version: ${prev:-none}"
+
+      - name: Deploy package to the Production service
+        uses: fastly/compute-actions/deploy@a25cf83ef5c19ef7d86f1eebffcd8f6c02ddc786 # v14
+        with:
+          service_id: ${{ vars.FASTLY_SERVICE_ID }}   # always explicit
+          version: ${{ steps.before.outputs.base }}
+          comment: "git:${{ needs.verify.outputs.sha }} run:${{ github.run_id }} env:production"
+        env:
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
+
+      - name: Record new active version
+        id: after
+        env:
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
+        run: |
+          v=$(scripts/release.sh active "$SERVICE_ID")
+          if [ -z "$v" ] || [ "$v" = "${{ steps.before.outputs.version }}" ]; then
+            echo "::error::deploy did not activate a new version (active=${v:-none})"; exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Health check & read-only smoke test
+        env:
+          SMOKE_WAIT: "600"
+        # Read-only: no links are created in production. --deep verifies Safe
+        # Browsing + the production API key without writing anything.
+        run: scripts/smoke-test.sh "$BASE_URL" --env production --expect-commit "$SHA" --deep
+
+      - name: Record release (tag deployed/production/vN)
+        env:
+          V: ${{ steps.after.outputs.version }}
+        run: |
+          scripts/release.sh tag production "$V" "$SHA" \
+            "production Fastly version $V; commit $SHA; run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}; by ${GITHUB_ACTOR}"
+          {
+            echo "## ✅ Production deployed"
+            echo "| | |"; echo "|---|---|"
+            echo "| URL | $BASE_URL |"
+            echo "| Commit | \`$SHA\` |"
+            echo "| Fastly version | $V (previous: ${{ steps.before.outputs.version || 'none' }}) |"
+            echo "| Release tag | \`deployed/production/v$V\` |"
+            echo "| Triggered by | ${GITHUB_ACTOR} (${GITHUB_EVENT_NAME}) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: How to roll back
+        if: failure() && steps.after.outputs.version != ''
+        env:
+          PREV: ${{ steps.before.outputs.version }}
+        run: |
+          {
+            echo "## ❌ Production smoke test failed"
+            echo "Production is NOT rolled back automatically (rollback needs explicit approval)."
+            echo "Roll back to the previous version ${PREV:-?}:"
+            echo '```'
+            echo "gh workflow run rollback.yml --ref main -f environment=production -f confirm=rollback-production -f target_version=${PREV}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

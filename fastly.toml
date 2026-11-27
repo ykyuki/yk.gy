@@ -1,0 +1,57 @@
+# Fastly Compute package manifest for yk.gy.
+# https://www.fastly.com/documentation/reference/compute/fastly-toml
+#
+# service_id is intentionally EMPTY. The same package is deployed to two
+# independent services and every deploy MUST pass --service-id explicitly
+# (GitHub Actions takes it from the environment's FASTLY_SERVICE_ID variable).
+# This prevents an accidental `fastly compute deploy` from targeting
+# production. [setup] is intentionally omitted for the same reason: Fastly
+# resources are created with scripts/fastly-setup.sh, per environment.
+
+authors = []
+description = "yk.gy URL shortener (Go on Fastly Compute)"
+language = "go"
+manifest_version = 3
+name = "yk-gy"
+service_id = ""
+
+[scripts]
+  env_vars = ["GOARCH=wasm", "GOOS=wasip1", "CGO_ENABLED=0"]
+  build = "go build -trimpath -o bin/main.wasm ./cmd/shortener"
+
+# ---------------------------------------------------------------------------
+# Local development server (`fastly compute serve`, http://localhost:7676).
+# Everything below exists only on your machine (Viceroy). It uses the SAME
+# logical names as production/development, but the data is local test data,
+# so local runs can never read or modify the Production / Development stores.
+# ---------------------------------------------------------------------------
+[local_server]
+
+  [local_server.backends]
+    # Only used when safebrowsing_mode = "live" locally (opt-in, see README).
+    [local_server.backends.safebrowsing]
+      url = "https://safebrowsing.googleapis.com"
+      override_host = "safebrowsing.googleapis.com"
+
+  [local_server.kv_stores]
+    links = { file = "test/data/local_kv.json", format = "json" }
+
+  [local_server.config_stores]
+    [local_server.config_stores.app_config]
+      format = "inline-toml"
+    [local_server.config_stores.app_config.contents]
+      environment = "local"
+      base_url = "http://localhost:7676"
+      short_hosts = "yk.gy,dev.yk.gy,localhost,127.0.0.1"
+      # "mock" is honoured ONLY on the local server (FASTLY_HOSTNAME=localhost).
+      safebrowsing_mode = "mock"
+      ratelimit_per_minute = "30"
+      ratelimit_penalty_seconds = "60"
+      ratelimit_on_error = "deny"
+      redirect_cache_ttl_seconds = "0"
+
+  [local_server.secret_stores]
+    # Empty unless you export SAFE_BROWSING_API_KEY yourself (live mode).
+    [[local_server.secret_stores.secrets]]
+      key = "safebrowsing_api_key"
+      env = "SAFE_BROWSING_API_KEY"

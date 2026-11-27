@@ -1,0 +1,143 @@
+# Development CD: every push / merge to `dev` runs the full CI and, only if it
+# succeeds, deploys the exact package CI built to the Development service
+# (dev.yk.gy), then runs health + smoke tests. A failed smoke test
+# automatically re-activates the previously active Development version.
+name: Deploy Development
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch: {}   # re-deploy the current dev HEAD
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-development
+  cancel-in-progress: false
+
+env:
+  FASTLY_CLI_VERSION: "17.2.0"
+
+jobs:
+  ci:
+    name: CI
+    if: github.ref == 'refs/heads/dev'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      pull-requests: read
+
+  deploy:
+    name: Deploy to dev.yk.gy
+    needs: [ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: development
+      url: ${{ vars.BASE_URL }}
+    permissions:
+      contents: write   # push the deployed/development/vN release tag
+    env:
+      SERVICE_ID: ${{ vars.FASTLY_SERVICE_ID }}
+      BASE_URL: ${{ vars.BASE_URL }}
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Check environment configuration
+        env:
+          HAS_TOKEN: ${{ secrets.FASTLY_API_TOKEN != '' }}
+        run: |
+          missing=""
+          [ -n "$SERVICE_ID" ] || missing="$missing FASTLY_SERVICE_ID(variable)"
+          [ -n "$BASE_URL" ]   || missing="$missing BASE_URL(variable)"
+          [ "$HAS_TOKEN" = "true" ] || missing="$missing FASTLY_API_TOKEN(secret)"
+          if [ -n "$missing" ]; then echo "::error::GitHub environment 'development' is missing:$missing"; exit 1; fi
+          case "$BASE_URL" in https://dev.yk.gy|https://dev.yk.gy/) ;; *)
+            echo "::error::BASE_URL for development must be https://dev.yk.gy (got $BASE_URL)"; exit 1;; esac
+
+      - name: Download the package built by CI for this commit
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.ci.outputs.artifact-name }}
+          path: pkg
+
+      - name: Verify package integrity
+        run: |
+          sha256sum -c pkg/yk-gy.tar.gz.sha256
+          test "$(jq -r .commit pkg/build-info.json)" = "$SHA"
+
+      - name: Set up Fastly CLI
+        uses: fastly/compute-actions/setup@a25cf83ef5c19ef7d86f1eebffcd8f6c02ddc786 # v14
+        with:
+          cli_version: ${{ env.FASTLY_CLI_VERSION }}
+          token: ${{ github.token }}
+
+      - name: Record currently active version
+        id: before
+        env:
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
+        run: |
+          prev=$(scripts/release.sh active "$SERVICE_ID")
+          echo "version=$prev" >> "$GITHUB_OUTPUT"
+          echo "base=$(scripts/release.sh base "$SERVICE_ID")" >> "$GITHUB_OUTPUT"
+          echo "Previously active version: ${prev:-none}"
+
+      - name: Deploy package to the Development service
+        uses: fastly/compute-actions/deploy@a25cf83ef5c19ef7d86f1eebffcd8f6c02ddc786 # v14
+        with:
+          service_id: ${{ vars.FASTLY_SERVICE_ID }}   # always explicit
+          version: ${{ steps.before.outputs.base }}
+          comment: "git:${{ github.sha }} run:${{ github.run_id }} env:development"
+        env:
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
+
+      - name: Record new active version
+        id: after
+        env:
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
+        run: |
+          v=$(scripts/release.sh active "$SERVICE_ID")
+          if [ -z "$v" ] || [ "$v" = "${{ steps.before.outputs.version }}" ]; then
+            echo "::error::deploy did not activate a new version (active=${v:-none})"; exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Activated Fastly version $v for $SHA"
+
+      - name: Health check & smoke test (writes ONE test link to Development)
+        env:
+          SMOKE_WAIT: "600"
+        run: scripts/smoke-test.sh "$BASE_URL" --env development --expect-commit "$SHA" --deep --write
+
+      - name: Record release (tag deployed/development/vN)
+        env:
+          V: ${{ steps.after.outputs.version }}
+        run: |
+          scripts/release.sh tag development "$V" "$SHA" \
+            "development Fastly version $V; commit $SHA; run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          {
+            echo "## ✅ Development deployed"
+            echo "| | |"; echo "|---|---|"
+            echo "| URL | $BASE_URL |"
+            echo "| Commit | \`$SHA\` |"
+            echo "| Fastly version | $V (previous: ${{ steps.before.outputs.version || 'none' }}) |"
+            echo "| Release tag | \`deployed/development/v$V\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Automatic rollback on failure
+        if: failure() && steps.after.outputs.version != '' && steps.before.outputs.version != ''
+        env:
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
+          PREV: ${{ steps.before.outputs.version }}
+          BAD: ${{ steps.after.outputs.version }}
+        run: |
+          echo "::warning::Smoke test failed on version $BAD; re-activating version $PREV"
+          fastly service version activate --service-id "$SERVICE_ID" --version "$PREV"
+          SMOKE_WAIT=300 scripts/smoke-test.sh "$BASE_URL" --env development || true
+          {
+            echo "## ❌ Development deploy failed — rolled back"
+            echo "Version $BAD failed the smoke test. Version $PREV was re-activated automatically."
+          } >> "$GITHUB_STEP_SUMMARY"
