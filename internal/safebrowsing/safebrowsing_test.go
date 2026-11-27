@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -137,9 +138,16 @@ func TestClientRejectsProtobufBody(t *testing.T) {
 }
 
 func TestReason(t *testing.T) {
-	body := `{"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"SERVICE_DISABLED"}]}}`
+	body := `{"error":{"code":403,"message":"Safe Browsing API has not been used in project 123","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"SERVICE_DISABLED"}]}}`
 	_, err := (&Client{APIKey: "secret-key", HTTP: &fakeHTTP{status: 403, body: body}}).Check(context.Background(), "https://example.com/")
 	if got := Reason(err); got != "http_status_403_SERVICE_DISABLED" {
+		t.Fatalf("got %q", got)
+	}
+	if !strings.Contains(err.Error(), "has not been used") || strings.Contains(err.Error(), "secret-key") {
+		t.Fatalf("log message should carry Google's message but never the key: %v", err)
+	}
+	_, err = (&Client{APIKey: "k", HTTP: &fakeHTTP{status: 400, body: `{"error":{"code":400,"message":"Invalid value","status":"INVALID_ARGUMENT"}}`}}).Check(context.Background(), "https://example.com/")
+	if got := Reason(err); got != "http_status_400_INVALID_ARGUMENT" {
 		t.Fatalf("got %q", got)
 	}
 	_, err = (&Client{APIKey: "secret-key", HTTP: &fakeHTTP{status: 500, body: "<html>"}}).Check(context.Background(), "https://example.com/")

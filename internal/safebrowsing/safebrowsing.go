@@ -84,7 +84,10 @@ func (c *Client) Check(ctx context.Context, rawURL string) (Verdict, error) {
 		return Verdict{}, fmt.Errorf("%w: request failed: %v", ErrUnavailable, err)
 	}
 	if status != 200 {
-		return Verdict{}, fmt.Errorf("%w: http status %d: %s", ErrUnavailable, status, googleErrorReason(body))
+		reason, msg := googleError(body)
+		// The message is logged (it never contains the key); health endpoints
+		// only expose Reason(err), which drops everything after " | ".
+		return Verdict{}, fmt.Errorf("%w: http status %d: %s | %s", ErrUnavailable, status, reason, msg)
 	}
 	if len(body) > maxResponseBytes {
 		return Verdict{}, fmt.Errorf("%w: response too large", ErrUnavailable)
@@ -115,29 +118,34 @@ func verdictFrom(r searchResponse) Verdict {
 	return Verdict{Safe: len(threats) == 0, Threats: threats}
 }
 
-// googleErrorReason extracts the machine-readable reason (e.g.
-// API_KEY_INVALID, SERVICE_DISABLED) from a Google API error body.
-func googleErrorReason(body []byte) string {
+// googleError extracts the machine-readable reason (e.g. API_KEY_INVALID,
+// SERVICE_DISABLED) and the human message from a Google API error body.
+func googleError(body []byte) (reason, message string) {
 	var e struct {
 		Error struct {
 			Status  string `json:"status"`
+			Message string `json:"message"`
 			Details []struct {
 				Reason string `json:"reason"`
 			} `json:"details"`
 		} `json:"error"`
 	}
 	if json.Unmarshal(body, &e) != nil {
-		return "unknown"
+		return "unknown", ""
+	}
+	message = strings.ReplaceAll(e.Error.Message, "\n", " ")
+	if len(message) > 300 {
+		message = message[:300]
 	}
 	for _, d := range e.Error.Details {
 		if d.Reason != "" {
-			return d.Reason
+			return d.Reason, message
 		}
 	}
 	if e.Error.Status != "" {
-		return e.Error.Status
+		return e.Error.Status, message
 	}
-	return "unknown"
+	return "unknown", message
 }
 
 // Reason returns a short, non-sensitive classification of a check error,
@@ -162,6 +170,9 @@ func Reason(err error) string {
 			fmt.Sscanf(rest, "%d", &code)
 			if j := strings.Index(rest, ": "); j >= 0 {
 				reason = rest[j+2:]
+				if k := strings.Index(reason, " | "); k >= 0 {
+					reason = reason[:k]
+				}
 			}
 		}
 		r := fmt.Sprintf("http_status_%d", code)
