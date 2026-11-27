@@ -9,7 +9,6 @@ import (
 	"io"
 	"mime"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 
@@ -159,20 +158,8 @@ func (h *Handler) shorten(ctx context.Context, w fsthttp.ResponseWriter, r *fsth
 	}
 
 	key := ratelimit.ClientKey(r.RemoteAddr)
-	// TEMPORARY diagnostics (development / local only): expose the limiter's
-	// cache operations for this request so per-POP behaviour can be verified.
-	var rlTrace []string
-	diag := h.Config.Environment == "development" || h.LocalRuntime
-	if diag {
-		ratelimit.Trace = func(s string) { rlTrace = append(rlTrace, s) }
-		defer func() { ratelimit.Trace = nil }()
-	}
 	if h.Limiter != nil {
 		ok, err := h.Limiter.Allow(key)
-		if diag {
-			w.Header().Set("X-Debug-Host", os.Getenv("FASTLY_HOSTNAME"))
-			w.Header().Set("X-Debug-Ratelimit", strings.Join(rlTrace, " | "))
-		}
 		if err != nil {
 			h.log(map[string]any{"event": "ratelimit_error", "error": err.Error()})
 			if !h.Config.RateLimitFailOpen {

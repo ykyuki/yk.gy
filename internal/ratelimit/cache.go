@@ -2,9 +2,7 @@ package ratelimit
 
 import (
 	"errors"
-	"fmt"
 	"io"
-	"strings"
 	"time"
 
 	"github.com/fastly/compute-sdk-go/cache/core"
@@ -21,31 +19,17 @@ import (
 // Objects are marked SensitiveData so they are never persisted to disk.
 type CoreCacheStore struct{}
 
-// Trace, when non-nil, receives one line per cache operation (diagnostics on
-// non-production environments only).
-var Trace func(string)
-
-func trace(format string, a ...any) {
-	if Trace != nil {
-		Trace(fmt.Sprintf(format, a...))
-	}
-}
-
 // Exists implements SlotStore.
 func (CoreCacheStore) Exists(key string) (bool, error) {
 	f, err := core.Lookup([]byte(key), core.LookupOptions{})
 	if errors.Is(err, core.ErrNotFound) {
-		trace("has %s=no", shortKey(key))
 		return false, nil
 	}
 	if err != nil {
-		trace("has %s err=%v", shortKey(key), err)
 		return false, err
 	}
 	_ = f.Body.Close()
-	ok := f.Usable() && !f.Stale()
-	trace("has %s=%v", shortKey(key), ok)
-	return ok, nil
+	return f.Usable() && !f.Stale(), nil
 }
 
 // Claim implements SlotStore: it creates key only if it does not exist yet.
@@ -54,17 +38,14 @@ func (CoreCacheStore) Exists(key string) (bool, error) {
 func (CoreCacheStore) Claim(key string, ttl time.Duration) (bool, error) {
 	tx, err := core.NewTransaction([]byte(key), core.LookupOptions{})
 	if err != nil {
-		trace("claim %s err=%v", shortKey(key), err)
 		return false, err
 	}
 	defer tx.Close()
 	if !tx.MustInsert() {
-		trace("claim %s=taken", shortKey(key))
 		return false, nil
 	}
 	w, err := tx.Insert(core.WriteOptions{TTL: ttl, Length: 1, SensitiveData: true})
 	if err != nil {
-		trace("claim %s insert err=%v", shortKey(key), err)
 		return false, err
 	}
 	if _, err := io.WriteString(w, "1"); err != nil {
@@ -72,20 +53,7 @@ func (CoreCacheStore) Claim(key string, ttl time.Duration) (bool, error) {
 		return false, err
 	}
 	if err := w.Close(); err != nil {
-		trace("claim %s close err=%v", shortKey(key), err)
 		return false, err
 	}
-	trace("claim %s=ok", shortKey(key))
 	return true, nil
-}
-
-// shortKey drops the configurable prefix for readable traces.
-func shortKey(k string) string {
-	if i := strings.Index(k, "pb:"); i >= 0 {
-		return k[i:]
-	}
-	if i := strings.Index(k, "rl:"); i >= 0 {
-		return k[i:]
-	}
-	return k
 }
