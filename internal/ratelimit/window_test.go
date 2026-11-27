@@ -120,18 +120,6 @@ func TestWindowConcurrentClaimMovesToNextSlot(t *testing.T) {
 	}
 }
 
-func itoa(n int64) string {
-	b := []byte{}
-	if n == 0 {
-		return "0"
-	}
-	for n > 0 {
-		b = append([]byte{byte('0' + n%10)}, b...)
-		n /= 10
-	}
-	return string(b)
-}
-
 func TestLocalUnsupportedFallback(t *testing.T) {
 	unsupported := errors.New("cache: operation not supported")
 	now := time.Now()
