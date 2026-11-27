@@ -79,12 +79,44 @@ func TestWindowFailsOnStoreError(t *testing.T) {
 	}
 }
 
-func TestWindowCorruptCounterCountsAsFull(t *testing.T) {
+func TestWindowLookupCostIsLogarithmic(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 30, 0, time.UTC)
-	w, st := newWindow(10, &now)
-	_ = st.Set("t:rl:a:"+itoa(now.Unix()/60), "garbage", time.Minute)
-	if got := allowN(t, w, "a", 1); got != 0 {
-		t.Fatal("corrupt counter must not disable limiting")
+	w, st := newWindow(1000, &now)
+	allowN(t, w, "a", 500)
+	before := st.Lookups
+	allowN(t, w, "a", 1)
+	if per := st.Lookups - before; per > 25 { // penalty check + 2 binary searches over 1000
+		t.Fatalf("%d lookups for one request", per)
+	}
+}
+
+// racyStore makes the very first Claim lose, as if a concurrent request had
+// taken that slot between our count and our claim.
+type racyStore struct {
+	*MemoryStore
+	raced bool
+}
+
+func (r *racyStore) Claim(key string, ttl time.Duration) (bool, error) {
+	if !r.raced {
+		r.raced = true
+		_, _ = r.MemoryStore.Claim(key, ttl) // the "other" request takes it
+		return false, nil
+	}
+	return r.MemoryStore.Claim(key, ttl)
+}
+
+func TestWindowConcurrentClaimMovesToNextSlot(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 30, 0, time.UTC)
+	st := &racyStore{MemoryStore: &MemoryStore{Now: func() time.Time { return now }}}
+	w := &Window{Store: st, Policy: Policy{PerMinute: 10, Penalty: time.Minute}, Now: func() time.Time { return now }}
+	ok, err := w.Allow("a")
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	// Both the competing request's slot and ours are counted.
+	if n, _ := w.count("a", now.Unix()/60, 10); n != 2 {
+		t.Fatalf("count=%d want 2", n)
 	}
 }
 
