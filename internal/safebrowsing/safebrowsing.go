@@ -84,7 +84,7 @@ func (c *Client) Check(ctx context.Context, rawURL string) (Verdict, error) {
 		return Verdict{}, fmt.Errorf("%w: request failed: %v", ErrUnavailable, err)
 	}
 	if status != 200 {
-		return Verdict{}, fmt.Errorf("%w: http status %d", ErrUnavailable, status)
+		return Verdict{}, fmt.Errorf("%w: http status %d: %s", ErrUnavailable, status, googleErrorReason(body))
 	}
 	if len(body) > maxResponseBytes {
 		return Verdict{}, fmt.Errorf("%w: response too large", ErrUnavailable)
@@ -113,4 +113,79 @@ func verdictFrom(r searchResponse) Verdict {
 		}
 	}
 	return Verdict{Safe: len(threats) == 0, Threats: threats}
+}
+
+// googleErrorReason extracts the machine-readable reason (e.g.
+// API_KEY_INVALID, SERVICE_DISABLED) from a Google API error body.
+func googleErrorReason(body []byte) string {
+	var e struct {
+		Error struct {
+			Status  string `json:"status"`
+			Details []struct {
+				Reason string `json:"reason"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &e) != nil {
+		return "unknown"
+	}
+	for _, d := range e.Error.Details {
+		if d.Reason != "" {
+			return d.Reason
+		}
+	}
+	if e.Error.Status != "" {
+		return e.Error.Status
+	}
+	return "unknown"
+}
+
+// Reason returns a short, non-sensitive classification of a check error,
+// suitable for health endpoints (never includes the API key or the URL).
+func Reason(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "api key missing"):
+		return "api_key_missing"
+	case strings.Contains(msg, "client not configured"):
+		return "client_not_configured"
+	case strings.Contains(msg, "request failed"):
+		return "request_failed"
+	case strings.Contains(msg, "http status"):
+		var code int
+		var reason string
+		if i := strings.Index(msg, "http status "); i >= 0 {
+			rest := msg[i+len("http status "):]
+			fmt.Sscanf(rest, "%d", &code)
+			if j := strings.Index(rest, ": "); j >= 0 {
+				reason = rest[j+2:]
+			}
+		}
+		r := fmt.Sprintf("http_status_%d", code)
+		if reason != "" && reason != "unknown" && isToken(reason) {
+			r += "_" + reason
+		}
+		return r
+	case strings.Contains(msg, "malformed response"):
+		return "malformed_response"
+	case strings.Contains(msg, "response too large"):
+		return "response_too_large"
+	}
+	return "unavailable"
+}
+
+func isToken(s string) bool {
+	if len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_') {
+			return false
+		}
+	}
+	return true
 }

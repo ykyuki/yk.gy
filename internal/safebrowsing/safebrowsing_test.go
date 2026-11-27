@@ -135,3 +135,26 @@ func TestClientRejectsProtobufBody(t *testing.T) {
 		t.Fatalf("protobuf body must be ErrUnavailable, got v=%+v err=%v", v, err)
 	}
 }
+
+func TestReason(t *testing.T) {
+	body := `{"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"SERVICE_DISABLED"}]}}`
+	_, err := (&Client{APIKey: "secret-key", HTTP: &fakeHTTP{status: 403, body: body}}).Check(context.Background(), "https://example.com/")
+	if got := Reason(err); got != "http_status_403_SERVICE_DISABLED" {
+		t.Fatalf("got %q", got)
+	}
+	_, err = (&Client{APIKey: "secret-key", HTTP: &fakeHTTP{status: 500, body: "<html>"}}).Check(context.Background(), "https://example.com/")
+	if got := Reason(err); got != "http_status_500" {
+		t.Fatalf("got %q", got)
+	}
+	_, err = (&Client{HTTP: &fakeHTTP{status: 200}}).Check(context.Background(), "https://example.com/")
+	if Reason(err) != "api_key_missing" {
+		t.Fatal(Reason(err))
+	}
+	_, err = (&Client{APIKey: "k", HTTP: &fakeHTTP{err: errors.New("dial tcp: secret-key")}}).Check(context.Background(), "https://example.com/")
+	if r := Reason(err); r != "request_failed" {
+		t.Fatalf("got %q", r)
+	}
+	if Reason(nil) != "" {
+		t.Fatal("nil")
+	}
+}
