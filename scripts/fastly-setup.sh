@@ -118,15 +118,22 @@ have_link() { [ "$APPLY" = 1 ] && fastly service resource-link list --service-id
 # ---------------------------------------------------------------- domain
 # Domains use the Domain Management API (account-level, not versioned); the
 # classic version-scoped domain API is deprecated.
-dom_owner=$(fastly domain list --fqdn "$DOMAIN" --json 2>/dev/null | jq -r --arg d "$DOMAIN" '
-  ([((.data // .Data // []))[] | select((.fqdn // .FQDN) == $d)][0]) as $m
-  | if $m == null then "" else ($m.service_id // $m.ServiceID // "unbound") end' 2>/dev/null)
-case "$dom_owner" in
-  ""|null) run fastly domain create --fqdn "$DOMAIN" --service-id "$SID" --description "yk.gy $ENVIRONMENT";;
-  "$SID")  echo "Domain $DOMAIN already bound to this service";;
-  *)       echo "ERROR: domain $DOMAIN already exists and is bound to '$dom_owner', not $SID. Fix it in the Fastly UI (Domains) and re-run." >&2
-           [ "$APPLY" = 1 ] && exit 1;;
-esac
+dom_json=$(fastly domain list --fqdn "$DOMAIN" --json 2>/dev/null | jq -c --arg d "$DOMAIN" '
+  [((.data // .Data // []))[] | select((.fqdn // .FQDN) == $d)][0] // empty' 2>/dev/null || true)
+dom_id=$(jq -r '.id // .ID // empty' <<<"${dom_json:-{\}}")
+dom_owner=$(jq -r '.service_id // .ServiceID // empty' <<<"${dom_json:-{\}}")
+if [ -z "$dom_json" ]; then
+  run fastly domain create --fqdn "$DOMAIN" --service-id "$SID" --description "yk.gy $ENVIRONMENT"
+elif [ "$dom_owner" = "$SID" ]; then
+  echo "Domain $DOMAIN already bound to this service"
+elif [ -z "$dom_owner" ]; then
+  # e.g. created by a TLS subscription before the service existed
+  echo "Domain $DOMAIN exists but is not bound to a service -> will bind it"
+  run fastly domain update --domain-id "$dom_id" --service-id "$SID"
+else
+  echo "ERROR: domain $DOMAIN is bound to another service ($dom_owner), not $SID. Fix it in the Fastly UI (Domains) and re-run." >&2
+  [ "$APPLY" = 1 ] && exit 1
+fi
 
 # ---------------------------------------------------------------- backend
 have_backend safebrowsing || run fastly service backend create --service-id "$SID" --version "$VERSION" \
@@ -164,7 +171,20 @@ have_link secrets    || run fastly service resource-link create --service-id "$S
 cfg() { run fastly config-store-entry update --store-id "${CFG_ID:-<cfg>}" --key "$1" --value "$2" --upsert; }
 cfg environment "$ENVIRONMENT"
 cfg base_url "https://$DOMAIN"
-cfg short_hosts "yk.gy,dev.yk.gy,www.yk.gy"
+# Every hostname that serves a yk.gy service is "our own": refusing them
+# prevents chaining short links. This includes the *.edgecompute.app default
+# domain that `fastly compute deploy` attaches on the first deploy, so re-run
+# this script after the first deploy.
+short_hosts="yk.gy,dev.yk.gy,www.yk.gy"
+for other in yk-gy-production yk-gy-development; do
+  osid=$(fastly service list --json | jq -r --arg n "$other" '[(. // [])[] | select(.Name == $n)][0].ServiceID // empty')
+  [ -n "$osid" ] || continue
+  for h in $(fastly service domain list --service-id "$osid" --version latest --json 2>/dev/null | jq -r '(. // [])[] | .Name'); do
+    short_hosts="$short_hosts,$h"
+  done
+done
+echo "short_hosts = $short_hosts"
+cfg short_hosts "$short_hosts"
 cfg safebrowsing_mode "live"
 cfg ratelimit_per_minute "$RATE"
 cfg ratelimit_penalty_seconds "300"
