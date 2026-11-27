@@ -58,6 +58,27 @@ run() {
 echo "== Environment: $ENVIRONMENT ($DOMAIN)"
 fastly whoami >/dev/null 2>&1 || { echo "Not authenticated. Run: fastly auth login --sso" >&2; exit 1; }
 
+# Preflight: make sure every store API is usable BEFORE changing anything, so a
+# permission problem cannot leave a half-configured service behind.
+preflight_ok=1
+for kind in kv-store config-store secret-store; do
+  if ! err=$(fastly "$kind" list --json 2>&1 >/dev/null); then
+    echo "PREFLIGHT FAILED: 'fastly $kind list' -> $(printf '%s' "$err" | grep -m1 'ERROR' || echo "$err" | head -1)" >&2
+    preflight_ok=0
+  fi
+done
+if [ "$preflight_ok" = 0 ]; then
+  cat >&2 <<'MSG'
+The current Fastly token cannot use one or more store APIs (403 = token scope /
+role, or the product is not enabled on the account). Fix it, then re-run:
+  - Create a token with "global" scope (Account > API tokens), or log in again:
+      fastly auth login --sso
+  - Make sure your user role can manage KV / Config / Secret Stores
+    (Engineer or Superuser) and that KV Store is enabled for the account.
+MSG
+  [ "$APPLY" = 1 ] && { echo "Nothing was changed." >&2; exit 1; }
+fi
+
 if [ "$APPLY" = 1 ]; then
   echo "This will create missing Fastly resources for '$ENVIRONMENT' (may incur charges)."
   read -r -p "Type '$DOMAIN' to continue: " ans
@@ -65,12 +86,12 @@ if [ "$APPLY" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------- service
-SID=$(fastly service list --json | jq -r --arg n "$SERVICE_NAME" '[.[] | select(.Name == $n)][0].ServiceID // empty')
+SID=$(fastly service list --json | jq -r --arg n "$SERVICE_NAME" '[(. // [])[] | select(.Name == $n)][0].ServiceID // empty')
 if [ -z "$SID" ]; then
   echo "Service '$SERVICE_NAME' not found -> will create (type wasm)"
   if [ "$APPLY" = 1 ]; then
     fastly service create --name "$SERVICE_NAME" --type wasm --comment "yk.gy $ENVIRONMENT" --non-interactive >&2
-    SID=$(fastly service list --json | jq -r --arg n "$SERVICE_NAME" '[.[] | select(.Name == $n)][0].ServiceID // empty')
+    SID=$(fastly service list --json | jq -r --arg n "$SERVICE_NAME" '[(. // [])[] | select(.Name == $n)][0].ServiceID // empty')
   else
     SID="<new-service-id>"
   fi
@@ -81,8 +102,8 @@ echo "Service ID: $SID"
 VERSION="latest"
 if [ "$APPLY" = 1 ]; then
   info=$(fastly service version list --service-id "$SID" --json)
-  latest=$(echo "$info" | jq -r 'max_by(.Number).Number')
-  locked=$(echo "$info" | jq -r 'max_by(.Number).Locked')
+  latest=$(echo "$info" | jq -r '(. // []) | max_by(.Number).Number')
+  locked=$(echo "$info" | jq -r '(. // []) | max_by(.Number).Locked')
   if [ "$locked" = "true" ]; then
     fastly service version clone --service-id "$SID" --version "$latest" >&2
     latest=$((latest + 1))
@@ -91,9 +112,9 @@ if [ "$APPLY" = 1 ]; then
   echo "Editing service version $VERSION"
 fi
 
-have_domain() { [ "$APPLY" = 1 ] && fastly service domain list --service-id "$SID" --version "$VERSION" --json | jq -e --arg d "$1" 'any(.[]; .Name == $d)' >/dev/null; }
-have_backend() { [ "$APPLY" = 1 ] && fastly service backend list --service-id "$SID" --version "$VERSION" --json | jq -e --arg b "$1" 'any(.[]; .Name == $b)' >/dev/null; }
-have_link() { [ "$APPLY" = 1 ] && fastly service resource-link list --service-id "$SID" --version "$VERSION" --json | jq -e --arg n "$1" 'any(.[]; .Name == $n)' >/dev/null; }
+have_domain() { [ "$APPLY" = 1 ] && fastly service domain list --service-id "$SID" --version "$VERSION" --json | jq -e --arg d "$1" 'any((. // [])[]; .Name == $d)' >/dev/null; }
+have_backend() { [ "$APPLY" = 1 ] && fastly service backend list --service-id "$SID" --version "$VERSION" --json | jq -e --arg b "$1" 'any((. // [])[]; .Name == $b)' >/dev/null; }
+have_link() { [ "$APPLY" = 1 ] && fastly service resource-link list --service-id "$SID" --version "$VERSION" --json | jq -e --arg n "$1" 'any((. // [])[]; .Name == $n)' >/dev/null; }
 
 # ---------------------------------------------------------------- domain
 have_domain "$DOMAIN" || run fastly service domain create --service-id "$SID" --version "$VERSION" --name "$DOMAIN"
@@ -114,7 +135,7 @@ store_id() { # $1=kv-store|config-store|secret-store $2=name
     return 0
   fi
   echo "$out" | jq -r --arg n "$2" '
-    (if type == "object" then (.Data // .data // []) else . end)
+    (if type == "object" then (.Data // .data // []) else (. // []) end)
     | [.[] | select((.Name // .name) == $n)][0] | (.StoreID // .ID // .id // empty)'
 }
 
@@ -144,7 +165,7 @@ cfg redirect_cache_ttl_seconds "$CACHE_TTL"
 # ---------------------------------------------------------------- secret (hidden prompt, never echoed)
 has_secret=0
 if [ "$APPLY" = 1 ] && fastly secret-store-entry list --store-id "$SEC_ID" --json 2>/dev/null | jq -e '
-    (if type == "object" then (.Data // .data // []) else . end) | any(.[]; (.Name // .name) == "safebrowsing_api_key")' >/dev/null; then
+    (if type == "object" then (.Data // .data // []) else (. // []) end) | any((. // [])[]; (.Name // .name) == "safebrowsing_api_key")' >/dev/null; then
   has_secret=1
 fi
 if [ "$has_secret" = 0 ] || [ "$ROTATE" = 1 ]; then
