@@ -18,8 +18,8 @@ const (
 	SecretSBKey     = "safebrowsing_api_key"
 	BackendSB       = "safebrowsing"
 	LogEndpoint     = "app_log"
-	RateCounter     = "shorten_rc"
-	PenaltyBox      = "shorten_pb"
+	// RateLimitPrefix namespaces the rate-limit counters in the POP cache.
+	RateLimitPrefix = "yk-gy:ratelimit:v1:"
 )
 
 // DefaultBlockedHosts are well known third-party shorteners. Chaining

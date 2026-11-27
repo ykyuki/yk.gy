@@ -15,6 +15,7 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/fastly/compute-sdk-go/cache/core"
 	"github.com/fastly/compute-sdk-go/configstore"
 	"github.com/fastly/compute-sdk-go/fsthttp"
 	"github.com/fastly/compute-sdk-go/rtlog"
@@ -63,7 +64,7 @@ func buildHandler() *handler.Handler {
 			Checker:    checker,
 			Validation: validation.Options{ShortHosts: cfg.ShortHosts, BlockedHosts: cfg.BlockedHosts},
 		},
-		Limiter: ratelimit.NewERL(config.RateCounter, config.PenaltyBox, ratelimit.Policy{PerMinute: cfg.RatePerMinute, Penalty: cfg.RatePenalty}),
+		Limiter: newLimiter(cfg, local, logger),
 		Health: func() map[string]error {
 			_, cerr := configstore.Open(config.ConfigStoreName)
 			_, serr := secretstore.Open(config.SecretStoreName)
@@ -74,6 +75,28 @@ func buildHandler() *handler.Handler {
 		ServiceVersion: os.Getenv("FASTLY_SERVICE_VERSION"),
 		LocalRuntime:   local,
 		Assets:         assets,
+	}
+}
+
+// newLimiter builds the cache-based rate limiter. Only on the local server
+// (Viceroy, which cannot read Core Cache entries from the Go SDK) an
+// "unsupported" cache error lets the request through with a warning; on
+// Fastly every cache error fails closed.
+func newLimiter(cfg config.Config, local bool, logger handler.Logger) ratelimit.Limiter {
+	w := &ratelimit.Window{
+		Store:  ratelimit.CoreCacheStore{},
+		Policy: ratelimit.Policy{PerMinute: cfg.RatePerMinute, Penalty: cfg.RatePenalty},
+		Prefix: config.RateLimitPrefix,
+	}
+	if !local {
+		return w
+	}
+	return ratelimit.LocalUnsupportedFallback{
+		Limiter:     w,
+		Unsupported: core.ErrUnsupported,
+		Warn: func(err error) {
+			logger(map[string]any{"event": "ratelimit_local_unsupported", "error": err.Error(), "msg": "rate limiting skipped on the local server only"})
+		},
 	}
 }
 

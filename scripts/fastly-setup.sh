@@ -216,6 +216,6 @@ cat <<EOF
      FASTLY_API_TOKEN  = (a token scoped to service $SID only; see README)
 2. Logging: create an endpoint named 'app_log' on this service with your provider, e.g.
      fastly service logging <provider> create --service-id $SID --version $VERSION --name app_log ...
-3. Edge Rate Limiting must be available on the account (see README).
-4. Deploy from GitHub Actions; then configure DNS/TLS for $DOMAIN (see README).
+3. Deploy from GitHub Actions; then configure DNS/TLS for $DOMAIN (see README).
+   (Rate limiting uses the Compute cache; no extra product such as ERL is needed.)
 EOF
