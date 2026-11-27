@@ -40,7 +40,7 @@ flowchart LR
     E -->|links| KV[(KV Store<br/>yk-gy-&lt;env&gt;-links)]
     E -->|app_config| CS[(Config Store<br/>yk-gy-&lt;env&gt;-config)]
     E -->|secrets| SS[(Secret Store<br/>yk-gy-&lt;env&gt;-secrets)]
-    E -->|shorten_rc / shorten_pb| ERL[Edge Rate Limiting]
+    E -->|レート制限カウンター| RL[(POP キャッシュ<br/>Core Cache)]
     E -->|app_log| LOG[ログ出力先（環境別）]
   end
 
@@ -52,7 +52,7 @@ flowchart LR
 | パス | 処理 |
 |---|---|
 | `GET /` | 埋め込み済みの 1 ページ UI（`web/`）を返す |
-| `POST /api/shorten` | ① Content-Type / Origin を確認 → ② レート制限（ERL） → ③ URL 検証・正規化 → ④ **Safe Browsing で必ず検査（障害時は拒否＝Fail Closed）** → ⑤ 暗号学的乱数で 7 文字コードを生成 → ⑥ KV Store に **条件付き書き込み（add モード：既存キーは上書き不可）**。衝突したらコードを再生成（最大 5 回） |
+| `POST /api/shorten` | ① Content-Type / Origin を確認 → ② レート制限（POP キャッシュ） → ③ URL 検証・正規化 → ④ **Safe Browsing で必ず検査（障害時は拒否＝Fail Closed）** → ⑤ 暗号学的乱数で 7 文字コードを生成 → ⑥ KV Store に **条件付き書き込み（add モード：既存キーは上書き不可）**。衝突したらコードを再生成（最大 5 回） |
 | `GET /{7文字}` | KV Store を参照して **HTTP 302**。POP 単位の Simple Cache で読み取りを高速化（TTL は環境別） |
 | `GET /healthz` | 稼働状況（環境名、コミット SHA、Fastly バージョン、各ストアの接続）。`?deep=1` を付けると Safe Browsing への接続と API キーも検査する（書き込みなし） |
 
@@ -67,7 +67,7 @@ Go のコードは全環境で共通です。コードが参照するのは **�
 | `secrets` | Secret Store | `yk-gy-production-secrets` | `yk-gy-development-secrets` | 環境変数 `SAFE_BROWSING_API_KEY`（任意） |
 | `safebrowsing` | Backend | safebrowsing.googleapis.com | 同左 | 同左（live モード時のみ） |
 | `app_log` | ログ出力先 | 本番用エンドポイント | 開発用エンドポイント | ターミナルに出力 |
-| `shorten_rc` / `shorten_pb` | ERL | サービスごとに独立 | サービスごとに独立 | Viceroy（常に許可） |
+| （キャッシュキー `yk-gy:ratelimit:v1:`） | Core Cache（レート制限） | サービス・POP ごとに独立 | サービス・POP ごとに独立 | Viceroy は読み出し未対応のため制限なし（警告ログ） |
 
 キャッシュ（Simple Cache）もサービス単位で分かれているため、環境間でキャッシュが共有されることはありません。
 
@@ -221,7 +221,7 @@ scripts/fastly-setup.sh production --apply
 fastly service logging --help
 ```
 
-**Edge Rate Limiting**：URL 発行 API のレート制限には ERL（Rate Counter / Penalty Box）を使います。ERL を使えないアカウントでは発行 API が `503 ratelimit_unavailable` を返します（Fail Closed）。Development のスモークテストで検知できます。一時的に運用を優先する場合は、その環境の Config Store で `ratelimit_on_error=allow` を設定します。
+**レート制限**：URL 発行 API のレート制限は、Compute に含まれる **Core Cache（POP ごとのキャッシュ）**で回数を数えます。Fastly の Edge Rate Limiting（ERL）は、Rate Counter と Penalty Box の数で別途課金される有償製品（Contact sales）のため使っていません。追加の製品の有効化や契約は不要です。
 
 ### 3.3 Google Safe Browsing API キー
 
@@ -554,7 +554,7 @@ git fetch --tags && git tag -l 'deployed/production/*' --sort=-v:refname
 |---|---|---|
 | 全体が 5xx / 応答なし | `make status`、Fastly ダッシュボード、https://www.fastlystatus.com/ | 直前のデプロイが原因ならロールバック（7 章） |
 | 発行が 503 `safety_check_unavailable` | `curl https://yk.gy/healthz?deep=1` | Safe Browsing の障害、キーの失効・クォータ超過。**意図した Fail Closed**です。キーを確認し、必要なら `--rotate-secret` で差し替える |
-| 発行が 503 `ratelimit_unavailable` | ログ（`event=ratelimit_error`） | ERL の状態を確認する。一時的には Config Store で `ratelimit_on_error=allow` |
+| 発行が 503 `ratelimit_unavailable` | ログ（`event=ratelimit_error`） | Core Cache の読み書きに失敗している。Fastly の状態を確認し、一時的には Config Store で `ratelimit_on_error=allow` |
 | 発行が 503 `storage_unavailable` | ログ（`event=shorten_failed`） | KV Store の状態や Resource Link（`links`）を確認する |
 | リダイレクトが 503 | `/healthz` の `kv_store` | 同上 |
 | 悪性リンクの通報 | — | KV のエントリを `disabled: true` に更新すると 410 になる（下記）。キャッシュ TTL（本番 1 時間）以内に反映される。すぐに反映したい場合はパージする |
@@ -581,7 +581,7 @@ fastly log-tail --service-id <SERVICE_ID>
 | ユニットテスト | `make test`（`go test ./...`） | 検証・コード生成・Safe Browsing クライアント・ハンドラ・レート制限・設定 |
 | 競合検出とカバレッジ | `make test-race` | `-race` とカバレッジ |
 | ファジング | `make fuzz` | URL 検証の堅牢性と冪等性 |
-| 統合テスト（Viceroy） | `make test-integration` | 実際の KV Store の add モード（上書き不可）、Simple Cache、ERL ホストコール |
+| 統合テスト（Viceroy） | `make test-integration` | 実際の KV Store の add モード（上書き不可）。キャッシュ方式のレート制限は Viceroy が読み出し未対応のためスキップされ、Development のスモークテストで検証する |
 | 静的解析 | `make lint` | gofmt / vet（wasip1 を含む）/ staticcheck / govulncheck |
 | CI 相当を一括実行 | `make check` | lint ＋ test ＋ integration ＋ build |
 | ローカル E2E | `make serve` を起動した状態で `make smoke` | 発行 → 302、悪性URLの拒否、Fail Closed、再帰登録・プライベート IP の拒否 |
@@ -610,7 +610,7 @@ curl -si http://127.0.0.1:7676/Example
 | 内部宛てURLの拒否 | `localhost`、`*.local` / `.internal` / `.home.arpa` などの内部名、単一ラベルのホスト、プライベート / ループバック / リンクローカル / CGNAT / 予約済み IP（IPv4・IPv6、IPv4-mapped、`2130706433` や `0x7f.1` のような 10 進・16 進・8 進表記も含む）、`nip.io` 系のワイルドカード DNS |
 | 再帰登録の防止 | `yk.gy` とそのサブドメイン（`dev.yk.gy` を含む）、リクエストの Host、他の主要な短縮サービス（bit.ly、t.co など）を拒否 |
 | その他の入力検証 | 2048 文字以内、制御文字・空白は拒否、ユーザー情報付きURL（`https://google.com@evil/`）は拒否、ポート番号を検証、IDN は punycode に正規化 |
-| レート制限 | Fastly ERL。クライアント IP（IPv6 は /64 単位）ごとに 1 分あたり N 回（本番 10、開発 20）。超えると 5 分間 Penalty Box に入れる。ERL のエラー時も既定では拒否する |
+| レート制限 | Core Cache を使ったスライディングウィンドウ（直前の1分を重み付けして加算）。クライアント IP（IPv6 は /64 単位）ごと、POP ごとに 1 分あたり N 回（本番 10、開発 20）。超えると 5 分間 Penalty Box（キャッシュ上の印）に入れる。キャッシュのエラー時も既定では拒否する。同時に来たリクエストは数え漏れることがある近似の制限 |
 | CSRF / クロスサイトからの悪用 | `Content-Type: application/json` を必須にし（他オリジンからはプリフライトが必要になり、そのプリフライトには応答しない）、Origin ヘッダーが付いていれば同一オリジンかを検証 |
 | XSS | フロントエンドは `textContent` / `value` だけで描画し（`innerHTML` は使わない）、エラーページは HTML エスケープ、JSON は `<>&` をエスケープ。厳格な CSP（`script-src 'self'`）、`X-Frame-Options: DENY`、`nosniff`、`Referrer-Policy: no-referrer`、HSTS |
 | コードの推測困難性 | `crypto/rand` を使い、リジェクションサンプリングで偏りのない 62^7（約 3.5 兆）通り |
@@ -685,7 +685,7 @@ SSRF について：このサービスは登録されたURLに**自分からア�
 ├── internal/
 │   ├── config/           # 論理リソース名と Config Store の読み込み
 │   ├── handler/          # HTTP ルーティング、API、302、セキュリティヘッダー
-│   ├── ratelimit/        # ERL によるレート制限
+│   ├── ratelimit/        # Core Cache によるレート制限（スライディングウィンドウ＋Penalty Box）
 │   ├── safebrowsing/     # Safe Browsing v5 クライアントとローカル専用モック
 │   ├── shortener/        # コード生成と登録フロー
 │   ├── storage/          # KV Store（条件付き書き込み、キャッシュ）

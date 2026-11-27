@@ -35,7 +35,7 @@ func newEnv(t *testing.T, checker safebrowsing.Checker) *env {
 	e.h = &Handler{
 		Config:  cfg,
 		Service: &shortener.Service{Store: e.store, Checker: checker, Validation: validation.Options{ShortHosts: cfg.ShortHosts, BlockedHosts: []string{"bit.ly"}}},
-		Limiter: &ratelimit.Memory{Policy: ratelimit.Policy{PerMinute: 3, Penalty: 300e9}},
+		Limiter: &ratelimit.Window{Store: &ratelimit.MemoryStore{}, Policy: ratelimit.Policy{PerMinute: 3, Penalty: 300e9}},
 		Log:     func(ev map[string]any) { e.logs = append(e.logs, ev) },
 		Commit:  "abc123", ServiceVersion: "7",
 		Assets: map[string]Asset{"index.html": {ContentType: "text/html; charset=utf-8", Body: []byte("<h1>hi</h1>")}},
