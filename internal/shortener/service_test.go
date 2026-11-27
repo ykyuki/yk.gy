@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -199,5 +200,35 @@ func TestShortenStaleIndexIsIgnored(t *testing.T) {
 	res, err := newSvc(st, &fakeChecker{v: safebrowsing.Verdict{Safe: true}}).Shorten(context.Background(), "https://example.com/")
 	if err != nil || res.Existing || res.Code == "Other01" {
 		t.Fatalf("stale index must not redirect to another URL: %+v %v", res, err)
+	}
+}
+
+func TestShortenNeverIssuesReservedPaths(t *testing.T) {
+	st := storage.NewMemoryStore()
+	svc := newSvc(st, &fakeChecker{v: safebrowsing.Verdict{Safe: true}})
+	// Random source yielding "privacy" first, then "healthz", then "AAAAAAA".
+	enc := func(code string) []byte {
+		b := make([]byte, 16)
+		for i := range b {
+			b[i] = 10 // 'A' filler
+		}
+		for i := 0; i < len(code); i++ {
+			b[i] = byte(strings.IndexByte(Alphabet, code[i]))
+		}
+		return b
+	}
+	var src []byte
+	src = append(src, enc("privacy")...)
+	src = append(src, enc("healthz")...)
+	src = append(src, enc("AAAAAAA")...)
+	svc.Rand = bytes.NewReader(src)
+	res, err := svc.Shorten(context.Background(), "https://example.com/reserved")
+	if err != nil || res.Code != "AAAAAAA" {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	for _, c := range []string{"privacy", "healthz"} {
+		if !IsValidCode(c) {
+			t.Fatalf("%s should have code shape (otherwise this guard is unnecessary)", c)
+		}
 	}
 }

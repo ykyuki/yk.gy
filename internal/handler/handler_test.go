@@ -491,11 +491,26 @@ func TestRateLimitedEventUsesSameIPRule(t *testing.T) {
 			post(e.h, `{"url":"https://example.org/`+string(rune('a'+i))+`"}`)
 		}
 		ev := lastEvent(t, e, "rate_limited")
-		if ev["ip"] != want || ev["rate_key"] != "203.0.113.5" {
-			t.Errorf("%s: %v", country, ev)
+		if ev["ip"] != want || ev["rate_key"] != want {
+			t.Errorf("%s: rate_key must follow the IP rule: %v", country, ev)
 		}
 		if _, ok := ev["client"]; ok {
 			t.Error("old client field must be gone")
 		}
+	}
+}
+
+func TestPrivacyPage(t *testing.T) {
+	e := newEnv(t, safebrowsing.Mock{})
+	e.h.Assets["privacy.html"] = Asset{ContentType: "text/html; charset=utf-8", Body: []byte("<h1>プライバシーポリシー</h1>")}
+	for _, p := range []string{"/privacy", "/privacy.html"} {
+		w := do(e.h, "GET", p, "", "", nil)
+		if w.Code != 200 || !strings.Contains(w.Body.String(), "プライバシーポリシー") || w.HeaderMap.Get("Cache-Control") != "no-cache" {
+			t.Fatalf("%s: %d %q", p, w.Code, w.HeaderMap.Get("Cache-Control"))
+		}
+	}
+	// "privacy" is 7 characters: it must not be treated as a short code.
+	if w := do(e.h, "GET", "/privacy", "", "", nil); w.HeaderMap.Get("Location") != "" {
+		t.Fatal("/privacy must not redirect")
 	}
 }

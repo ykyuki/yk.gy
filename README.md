@@ -624,7 +624,7 @@ fastly kv-store-entry create --store-id <本番KV ID> --key <CODE> --value '{"ur
 - **EU 27か国・EEA 3か国（アイスランド・リヒテンシュタイン・ノルウェー）・英国からのアクセスでは、`ip` を `null` にします**（GDPR / UK GDPR への配慮）。国を判定できなかった場合も `null` にします（`internal/privacy`）。
 - CSS・JS などの静的ファイル、HEAD リクエスト、`/healthz` は記録しません。
 - ローカル（`fastly compute serve`）では、`fastly.toml` の `[local_server.geolocation]` で `127.0.0.1` を日本（JP）として扱います。
-- IP アドレスを記録するので、プライバシーポリシー（収集する情報、目的、保存期間、預け先）を公開し、Datadog の保存期間とアクセス権を必要な範囲に絞ることをおすすめします。
+- 収集する情報・目的・預け先・保存期間は、プライバシーポリシー（`/privacy`、`web/privacy.html`）で公開しています。ログの保存期間は **15日** と定めているので、Datadog のインデックスの保存期間（Logs → Configuration → Indexes の Retention）を15日に設定してください。ポリシーと実際の設定がずれないよう注意します。
 
 ## 9. 環境ごとのテスト方法
 

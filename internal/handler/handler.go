@@ -98,6 +98,9 @@ func (h *Handler) ServeHTTP(ctx context.Context, w fsthttp.ResponseWriter, r *fs
 		}
 		h.asset(w, r, "index.html")
 		return
+	case "/privacy", "/privacy.html":
+		h.asset(w, r, "privacy.html")
+		return
 	case "/style.css", "/app.js", "/favicon.svg", "/robots.txt":
 		h.asset(w, r, strings.TrimPrefix(path, "/"))
 		return
@@ -150,7 +153,7 @@ func (h *Handler) asset(w fsthttp.ResponseWriter, r *fsthttp.Request, name strin
 		return
 	}
 	w.Header().Set("Content-Type", a.ContentType)
-	if name == "index.html" {
+	if strings.HasSuffix(name, ".html") {
 		w.Header().Set("Cache-Control", "no-cache")
 	} else {
 		w.Header().Set("Cache-Control", "public, max-age=300")
@@ -433,6 +436,10 @@ func (h *Handler) log(ev map[string]any) {
 		ev["ip"] = h.clientIP
 	} else {
 		ev["ip"] = nil
+		// Other fields derived from the IP must not leak it either.
+		if _, ok := ev["rate_key"]; ok {
+			ev["rate_key"] = nil
+		}
 	}
 	h.Log(ev)
 }

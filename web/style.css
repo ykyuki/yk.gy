@@ -117,3 +117,14 @@ h2 { font-size: 1.1rem; margin: 0 0 8px; }
 .footer-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-top: 12px; }
 .footer-meta p { margin: 0; }
 .contact a { color: var(--accent); }
+
+.policy-link a { color: var(--accent); }
+.policy h1 { font-size: 1.6rem; margin-bottom: 4px; }
+.policy h2 { font-size: 1.1rem; margin: 28px 0 8px; padding-top: 8px; border-top: 1px solid var(--border); }
+.policy h3 { font-size: .95rem; margin: 16px 0 6px; }
+.policy p, .policy li { font-size: .92rem; }
+.policy ul { padding-left: 1.3em; margin: 6px 0 10px; }
+.policy li { margin: 4px 0; }
+.policy a { color: var(--accent); }
+.policy .meta { color: var(--muted); font-size: .85rem; margin-top: 0; }
+.policy .back { font-size: .9rem; }
