@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"runtime/debug"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/fastly/compute-sdk-go/cache/core"
 	"github.com/fastly/compute-sdk-go/configstore"
 	"github.com/fastly/compute-sdk-go/fsthttp"
+	"github.com/fastly/compute-sdk-go/geo"
 	"github.com/fastly/compute-sdk-go/rtlog"
 	"github.com/fastly/compute-sdk-go/secretstore"
 
@@ -75,6 +77,7 @@ func buildHandler() *handler.Handler {
 		ServiceVersion: os.Getenv("FASTLY_SERVICE_VERSION"),
 		LocalRuntime:   local,
 		Assets:         assets,
+		Country:        countryOf,
 	}
 }
 
@@ -98,6 +101,16 @@ func newLimiter(cfg config.Config, local bool, logger handler.Logger) ratelimit.
 			logger(map[string]any{"event": "ratelimit_local_unsupported", "error": err.Error(), "msg": "rate limiting skipped on the local server only"})
 		},
 	}
+}
+
+// countryOf returns the country code from Fastly's geolocation ("" if
+// unknown or on error).
+func countryOf(ip string) string {
+	g, err := geo.Lookup(net.ParseIP(ip))
+	if err != nil || g == nil {
+		return ""
+	}
+	return g.CountryCode
 }
 
 func configGetter() config.Getter {
