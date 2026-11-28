@@ -50,6 +50,7 @@ func (h *Handler) shortenGet(ctx context.Context, w fsthttp.ResponseWriter, r *f
 			ErrMsg: "url パラメータに短縮したいURLを指定してください。例: " + h.baseURL(r) + "/api/shorten?url=https%3A%2F%2Fexample.com%2F"})
 		return
 	}
+	h.via = "get"
 	h.writeGetOutcome(w, text, h.shortenURL(ctx, r, raw))
 }
 
@@ -72,6 +73,7 @@ func (h *Handler) writeGetOutcome(w fsthttp.ResponseWriter, text bool, o outcome
 
 // mcp serves the remote MCP endpoint.
 func (h *Handler) mcp(ctx context.Context, w fsthttp.ResponseWriter, r *fsthttp.Request) {
+	h.via = "mcp"
 	var body []byte
 	if r.Method == fsthttp.MethodPost {
 		b, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
@@ -88,7 +90,12 @@ func (h *Handler) mcp(ctx context.Context, w fsthttp.ResponseWriter, r *fsthttp.
 			"Return the short_url to the user. The same URL always returns the same short URL. " +
 			"Only http/https URLs are accepted; URLs flagged by Google Safe Browsing, private/localhost addresses and other URL shorteners are refused.",
 		AllowedOrigin: func(origin string) bool { return h.sameOrigin(origin, r) },
-		Shorten: func(ctx context.Context, url string) mcp.ShortenResult {
+		OnInitialize: func(c mcp.ClientInfo, protocolVersion string) {
+			h.mcpClient, h.mcpClientVersion = c.Name, c.Version
+			h.log(map[string]any{"event": "mcp_initialize", "protocol_version": nullable(protocolVersion)})
+		},
+		Shorten: func(ctx context.Context, url string, c mcp.ClientInfo) mcp.ShortenResult {
+			h.mcpClient, h.mcpClientVersion = c.Name, c.Version
 			o := h.shortenURL(ctx, r, url)
 			if o.Resp == nil {
 				return mcp.ShortenResult{ErrCode: o.ErrCode, ErrMsg: o.ErrMsg}

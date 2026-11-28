@@ -514,3 +514,55 @@ func TestPrivacyPage(t *testing.T) {
 		t.Fatal("/privacy must not redirect")
 	}
 }
+
+func TestShortenLogsCarryEntryPoint(t *testing.T) {
+	e := newEnv(t, safebrowsing.Mock{})
+	e.h.Limiter = &ratelimit.Window{Store: &ratelimit.MemoryStore{}, Policy: ratelimit.Policy{PerMinute: 100, Penalty: 300e9}}
+	e.h.Country = func(string) string { return "JP" }
+
+	post(e.h, `{"url":"https://www.example.org/via"}`)
+	if ev := lastEvent(t, e, "link_created"); ev["via"] != "post" {
+		t.Fatalf("post: %v", ev)
+	}
+	do(e.h, "GET", "/api/shorten?url="+url.QueryEscape("https://www.example.org/via"), "", "", nil)
+	ev := lastEvent(t, e, "link_reused")
+	if ev["via"] != "get" || ev["code"] == nil || ev["ip"] != "203.0.113.5" {
+		t.Fatalf("get reuse: %v", ev)
+	}
+	if _, ok := ev["mcp_client"]; ok {
+		t.Fatal("mcp fields only for MCP requests")
+	}
+	// Page views are not shorten requests: no via.
+	do(e.h, "GET", "/", "", "", nil)
+	if _, ok := lastEvent(t, e, "page_view")["via"]; ok {
+		t.Fatal("page_view must not carry via")
+	}
+}
+
+func TestMCPLogsClientInfo(t *testing.T) {
+	e := newEnv(t, safebrowsing.Mock{})
+	e.h.Country = func(string) string { return "US" }
+	ua := map[string]string{"User-Agent": "openai-mcp/1.0 (+https://openai.com/bot)"}
+
+	// Legacy initialize: name recorded on mcp_initialize.
+	do(e.h, "POST", "/mcp", "application/json", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"openai-mcp","version":"1.0"}}}`, ua)
+	ev := lastEvent(t, e, "mcp_initialize")
+	if ev["mcp_client"] != "openai-mcp" || ev["mcp_client_version"] != "1.0" || ev["protocol_version"] != "2025-06-18" || ev["via"] != "mcp" || ev["user_agent"] != ua["User-Agent"] {
+		t.Fatalf("initialize: %v", ev)
+	}
+
+	// Legacy tools/call has no clientInfo: name is null, User-Agent kept.
+	do(e.h, "POST", "/mcp", "application/json", `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"shorten_url","arguments":{"url":"https://www.example.org/mcp-a"}}}`, ua)
+	ev = lastEvent(t, e, "link_created")
+	if ev["via"] != "mcp" || ev["mcp_client"] != nil || ev["user_agent"] != ua["User-Agent"] {
+		t.Fatalf("legacy call: %v", ev)
+	}
+
+	// Stateless revision: clientInfo in _meta; same URL -> link_reused.
+	meta := `"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"claude-ai","version":"2"}}`
+	do(e.h, "POST", "/mcp", "application/json", `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"shorten_url","arguments":{"url":"https://www.example.org/mcp-a"},`+meta+`}}`, map[string]string{"MCP-Protocol-Version": "2026-07-28"})
+	ev = lastEvent(t, e, "link_reused")
+	if ev["via"] != "mcp" || ev["mcp_client"] != "claude-ai" || ev["mcp_client_version"] != "2" || ev["user_agent"] != nil {
+		t.Fatalf("stateless call: %v", ev)
+	}
+}

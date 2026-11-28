@@ -614,12 +614,16 @@ fastly kv-store-entry create --store-id <本番KV ID> --key <CODE> --value '{"ur
 |---|---|---|
 | `page_view` | トップページの表示（GET） | `path` |
 | `redirect` | 短縮 URL へのアクセス | `code`、`status`（302 / 404 / 410）、`target_host`（302 のとき） |
-| `link_created` | 新しい短縮 URL の発行 | `code`、`target_host` |
+| `link_created` | 新しい短縮 URL の発行 | `code`、`target_host`、`via` |
+| `link_reused` | 発行済みの URL に既存の短縮 URL を返した | `code`、`target_host`、`via` |
+| `mcp_initialize` | MCP クライアントの接続開始（`initialize`。旧方式のクライアントのみ） | `protocol_version` |
 | `unsafe_rejected` | Safe Browsing による拒否 | `threats` |
 | `rate_limited` | レート制限による拒否 | `rate_key`（IPv6 は /64） |
 | `safebrowsing_unavailable` / `deep_health_safebrowsing_error` / `ratelimit_error` / `shorten_failed` / `resolve_failed` | 障害 | `error` |
 
 **すべてのログ**に、`env`・`service_version`・`country`（Fastly のジオロケーションで判定した国コード）・`ip`（**完全な IP アドレス**）が付きます。
+
+発行に関わるログ（`link_created` / `link_reused` / `unsafe_rejected` / `rate_limited` / 障害）には、経路を示す `via`（`post`＝画面、`get`＝GET API、`mcp`＝MCP）が付きます。MCP の場合はさらに、`mcp_client` / `mcp_client_version`（クライアントの自己申告の名前）と `user_agent` が付きます。MCP サーバーはステートレスなので、`initialize` で名乗った名前を後の `tools/call` と結びつけられません。そのため、旧方式（2025-xx）のクライアントの `tools/call` では `mcp_client` が null になり、`user_agent` で見分けます。新方式（2026-07-28）のクライアントは、リクエストごとに名前を送ってきます。なお、ChatGPT や Claude のコネクター経由の場合、`ip` と `country` は利用者本人ではなく、AI 事業者のサーバーのものです。
 
 - **EU 27か国・EEA 3か国（アイスランド・リヒテンシュタイン・ノルウェー）・英国からのアクセスでは、`ip` を `null` にします**（GDPR / UK GDPR への配慮）。国を判定できなかった場合も `null` にします（`internal/privacy`）。
 - CSS・JS などの静的ファイル、HEAD リクエスト、`/healthz` は記録しません。
