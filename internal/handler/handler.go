@@ -57,11 +57,19 @@ type Handler struct {
 	clientIP      string
 	clientCountry string
 	countryLooked bool
+	userAgent     string
+	// via is the entry point of a shorten request ("post", "get", "mcp");
+	// mcpClient/mcpClientVersion are what an MCP client says it is.
+	via              string
+	mcpClient        string
+	mcpClientVersion string
 }
 
 // ServeHTTP implements fsthttp.Handler.
 func (h *Handler) ServeHTTP(ctx context.Context, w fsthttp.ResponseWriter, r *fsthttp.Request) {
 	h.clientIP, h.clientCountry, h.countryLooked = privacy.ClientIP(r.RemoteAddr), "", false
+	h.userAgent = r.Header.Get("User-Agent")
+	h.via, h.mcpClient, h.mcpClientVersion = "", "", ""
 	h.securityHeaders(w)
 	path := r.URL.Path
 
@@ -216,6 +224,7 @@ func (h *Handler) shortenURL(ctx context.Context, r *fsthttp.Request, rawURL str
 	status := fsthttp.StatusCreated
 	if res.Existing {
 		status = fsthttp.StatusOK
+		h.log(map[string]any{"event": "link_reused", "code": res.Code, "target_host": hostOf(res.URL)})
 	} else {
 		h.log(map[string]any{"event": "link_created", "code": res.Code, "target_host": hostOf(res.URL)})
 	}
@@ -266,6 +275,7 @@ func (h *Handler) shorten(ctx context.Context, w fsthttp.ResponseWriter, r *fsth
 		return
 	}
 
+	h.via = "post"
 	h.writeOutcome(w, h.shortenURL(ctx, r, req.URL))
 }
 
@@ -441,7 +451,37 @@ func (h *Handler) log(ev map[string]any) {
 			ev["rate_key"] = nil
 		}
 	}
+	if h.via != "" {
+		ev["via"] = h.via
+	}
+	if h.via == "mcp" {
+		ev["mcp_client"] = nullable(h.mcpClient)
+		ev["mcp_client_version"] = nullable(h.mcpClientVersion)
+		// Stateless MCP: legacy clients only name themselves in initialize,
+		// so the User-Agent is kept as a fallback identification.
+		ev["user_agent"] = nullable(clipUA(h.userAgent))
+	}
 	h.Log(ev)
+}
+
+func nullable(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+func clipUA(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+	if len(s) > 200 {
+		s = s[:200]
+	}
+	return s
 }
 
 func (h *Handler) country() string {

@@ -13,8 +13,8 @@ func newServer() (*Server, *[]string) {
 	s := &Server{
 		Name: "yk.gy", Title: "t", Version: "test", Instructions: "use shorten_url",
 		AllowedOrigin: func(o string) bool { return o == "https://yk.gy" },
-		Shorten: func(_ context.Context, u string) ShortenResult {
-			calls = append(calls, u)
+		Shorten: func(_ context.Context, u string, c ClientInfo) ShortenResult {
+			calls = append(calls, u+"|"+c.Name)
 			if strings.Contains(u, "evil") {
 				return ShortenResult{ErrCode: "unsafe_url", ErrMsg: "dangerous"}
 			}
@@ -73,7 +73,7 @@ func TestLegacyHandshakeFlow(t *testing.T) {
 	if res["content"].([]any)[0].(map[string]any)["text"] != "https://yk.gy/AbC1234" {
 		t.Fatal("first text block should be the bare short URL")
 	}
-	if len(*calls) != 1 || (*calls)[0] != "https://example.com/a" {
+	if len(*calls) != 1 || (*calls)[0] != "https://example.com/a|" {
 		t.Fatalf("calls=%v", *calls)
 	}
 }
@@ -149,5 +149,20 @@ func TestTransportRules(t *testing.T) {
 	}
 	if r := s.Handle(context.Background(), Request{Method: http.MethodPost, Header: func(string) string { return "" }}); r.Status != 400 {
 		t.Fatalf("empty body: %d", r.Status)
+	}
+}
+
+func TestClientInfoIsPassedThrough(t *testing.T) {
+	s, calls := newServer()
+	var inits []string
+	s.OnInitialize = func(c ClientInfo, v string) { inits = append(inits, c.Name+"/"+c.Version+"@"+v) }
+	post(s, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"openai-mcp","version":"1.2"}}}`, nil)
+	if len(inits) != 1 || inits[0] != "openai-mcp/1.2@2025-06-18" {
+		t.Fatalf("%v", inits)
+	}
+	meta := `"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"claude-ai\u0000\n","version":"9"}}`
+	post(s, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"shorten_url","arguments":{"url":"https://example.com/b"},`+meta+`}}`, map[string]string{"MCP-Protocol-Version": "2026-07-28"})
+	if (*calls)[len(*calls)-1] != "https://example.com/b|claude-ai" {
+		t.Fatalf("client from _meta (control chars stripped): %v", *calls)
 	}
 }

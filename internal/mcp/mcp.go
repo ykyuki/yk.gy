@@ -28,6 +28,7 @@ var SupportedVersions = append([]string{LatestVersion}, legacyVersions...)
 const (
 	metaVersion  = "io.modelcontextprotocol/protocolVersion"
 	metaServer   = "io.modelcontextprotocol/serverInfo"
+	metaClient   = "io.modelcontextprotocol/clientInfo"
 	toolName     = "shorten_url"
 	maxURLLength = 2048
 )
@@ -49,14 +50,24 @@ type ShortenResult struct {
 	ErrCode, ErrMsg     string
 }
 
+// ClientInfo identifies the MCP client as it describes itself (clientInfo
+// in initialize, or in _meta on every request in the stateless revision).
+// Empty when the client did not send it.
+type ClientInfo struct {
+	Name, Version string
+}
+
 // Server is a stateless MCP server.
 type Server struct {
 	Name, Title, Version, Instructions string
 	// AllowedOrigin validates a browser Origin header (DNS-rebinding
 	// protection). Requests without Origin (server-side clients) pass.
 	AllowedOrigin func(origin string) bool
-	// Shorten performs the tool call.
-	Shorten func(ctx context.Context, url string) ShortenResult
+	// Shorten performs the tool call. client is what the request carries
+	// (stateless servers cannot remember what was sent in initialize).
+	Shorten func(ctx context.Context, url string, client ClientInfo) ShortenResult
+	// OnInitialize, if set, is called for every initialize request.
+	OnInitialize func(client ClientInfo, protocolVersion string)
 }
 
 // Request is the transport-independent HTTP request.
@@ -120,6 +131,7 @@ func (s *Server) Handle(ctx context.Context, req Request) Response {
 	var params struct {
 		Meta            map[string]any  `json:"_meta"`
 		ProtocolVersion string          `json:"protocolVersion"` // initialize (legacy)
+		ClientInfo      *clientInfoJSON `json:"clientInfo"`      // initialize (legacy)
 		Name            string          `json:"name"`
 		Arguments       json.RawMessage `json:"arguments"`
 	}
@@ -150,6 +162,9 @@ func (s *Server) Handle(ctx context.Context, req Request) Response {
 		v := params.ProtocolVersion
 		if !slices.Contains(legacyVersions, v) {
 			v = legacyVersions[0]
+		}
+		if s.OnInitialize != nil {
+			s.OnInitialize(params.ClientInfo.toClientInfo(), params.ProtocolVersion)
 		}
 		return s.result(rr.ID, false, map[string]any{
 			"protocolVersion": v,
@@ -186,7 +201,7 @@ func (s *Server) Handle(ctx context.Context, req Request) Response {
 		if len(args.URL) > maxURLLength*3 {
 			return s.result(rr.ID, stateless, toolError("too_long", "The URL is too long (max 2048 characters)."))
 		}
-		r := s.Shorten(ctx, args.URL)
+		r := s.Shorten(ctx, args.URL, clientFromMeta(params.Meta))
 		if r.ShortURL == "" {
 			return s.result(rr.ID, stateless, toolError(r.ErrCode, r.ErrMsg))
 		}
@@ -267,4 +282,38 @@ func errorResponse(status int, id json.RawMessage, code int, msg string, data an
 	}
 	b, _ := json.Marshal(m)
 	return Response{Status: status, ContentType: "application/json", Body: b}
+}
+
+type clientInfoJSON struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+func (c *clientInfoJSON) toClientInfo() ClientInfo {
+	if c == nil {
+		return ClientInfo{}
+	}
+	return ClientInfo{Name: clip(c.Name), Version: clip(c.Version)}
+}
+
+// clientFromMeta reads _meta["io.modelcontextprotocol/clientInfo"].
+func clientFromMeta(meta map[string]any) ClientInfo {
+	m, _ := meta[metaClient].(map[string]any)
+	name, _ := m["name"].(string)
+	version, _ := m["version"].(string)
+	return ClientInfo{Name: clip(name), Version: clip(version)}
+}
+
+// clip bounds client-supplied strings before they reach logs.
+func clip(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+	if len(s) > 100 {
+		s = s[:100]
+	}
+	return s
 }
